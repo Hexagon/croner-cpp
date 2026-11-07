@@ -199,7 +199,7 @@ class CronPattern {
 
   void parse() {
     // Handle @yearly, @monthly etc
-    if (contains(pattern, '@')) pattern = trim(handle_nicknames(pattern));
+    if (contains(pattern, '@')) pattern = trim(handle_nicknames(pattern, alternative_weekdays));
 
     // Split on any whitespace
     std::vector<std::string> parts;
@@ -543,7 +543,7 @@ class CronPattern {
     }
   }
 
-  static std::string handle_nicknames(const std::string& p) {
+  static std::string handle_nicknames(const std::string& p, bool quartz_weekdays) {
     const std::string clean = to_lower(trim(p));
     if (clean == "@reboot") {
       fail(
@@ -559,6 +559,8 @@ class CronPattern {
         {"@midnight", "0 0 * * *"},
         {"@hourly", "0 * * * *"},
     }};
+    // Sunday is 1 with Quartz weekday numbering (croner.js rejects @weekly in that mode)
+    if (clean == "@weekly" && quartz_weekdays) return "0 0 * * 1";
     for (const auto& [name, value] : nicknames)
       if (clean == name) return value;
     return p;

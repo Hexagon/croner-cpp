@@ -6,6 +6,7 @@
 #ifndef CRONER_DATE_HPP
 #define CRONER_DATE_HPP
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdlib>
@@ -275,7 +276,12 @@ class CronDate {
                  int offset, int direction) {
     const int original = get(target);
     const auto arr = values(pattern, target);
-    for (int i = original + offset; direction == 1 ? i < arr.second : i >= 0; i += direction) {
+    // A day after the last day of the month does not exist. Searching past it would roll over
+    // into the next month (e.g. February 31 to March 3) and skip the first days of that month.
+    // croner.js 11.0.0 has that bug: "0 0 1,31 * *" searched from February 2 skips March 1.
+    const int end = target == Target::Day ? (std::min)(arr.second, last_day_of_month(year, month))
+                                          : arr.second;
+    for (int i = original + offset; direction == 1 ? i < end : i >= 0; i += direction) {
       bool m = arr.first[i] != 0;
       if (target == Target::Day) m = match_day_value(m, i - offset, pattern, options);
       if (m) {

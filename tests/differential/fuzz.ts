@@ -149,6 +149,54 @@ for (let i = 0; i < cases; i++) {
   ]);
 }
 
+// deno-lint-ignore no-explicit-any
+function makeJob(c: Case): any {
+  const [pat, tz, off, dad, alt, sloppy, interval, startAt, stopAt, dayOffset, mode, , , , maxRuns] = c;
+  // deno-lint-ignore no-explicit-any
+  const o: any = {
+    domAndDow: dad === "1", alternativeWeekdays: alt === "1", sloppyRanges: sloppy === "1",
+    interval: Number(interval), dayOffset: Number(dayOffset), mode,
+  };
+  if (tz) o.timezone = tz;
+  if (off) o.utcOffset = Number(off);
+  if (startAt) o.startAt = startAt;
+  if (stopAt) o.stopAt = stopAt;
+  if (maxRuns) o.maxRuns = Number(maxRuns);
+  return new Cron(pat, o);
+}
+
+// Bugs in croner.js 11.0.0 that the C++ port fixes:
+// - The day search rolls over past the end of the month (February 31 becomes March 3), and skips
+//   the first days of the next month: "0 0 1,31 * *" from February 2 skips March 1. Recognized
+//   when the first differing C++ run is earlier than croner.js's, and croner.js's own match()
+//   confirms that it matches the pattern.
+// - "@weekly" is rejected with alternativeWeekdays, as it expands to Sunday as 0.
+function jsBugFixedInCpp(c: Case, js: string, cpp: string): boolean {
+  const [pat, , , , alt, , interval, , , dayOffset, , ref, dir] = c;
+  if (js === "ERR" && pat.trim().toLowerCase() === "@weekly" && alt === "1") return true;
+  if (dir !== "n" || cpp === "-" || cpp === "ERR" || js === "ERR") return false;
+  const j = js === "-" ? [] : js.split(","), k = cpp.split(",");
+  let i = 0;
+  while (i < j.length && i < k.length && j[i] === k[i]) i++;
+  if (i >= k.length) return false;
+  const run = Date.parse(k[i]);
+  if (i < j.length && run >= Date.parse(j[i])) return false;
+  // With an interval, the run must also be at least an interval after the previous one
+  const intervalMs = Number(interval) * 1000;
+  if (intervalMs > 0) {
+    // A reference without Z is wall clock time, at most 15 hours from UTC
+    const reference = ref.endsWith("Z") ? Date.parse(ref) : Date.parse(ref + "Z") + 15 * 3600000;
+    const previous = i > 0 ? Date.parse(k[i - 1]) : reference;
+    if (run - previous < intervalMs) return false;
+  }
+  try {
+    // dayOffset shifts runs, the pattern matches the unshifted date
+    return makeJob(c).match(new Date(run - Number(dayOffset) * 86400000));
+  } catch {
+    return false;
+  }
+}
+
 function runJs(c: Case): string {
   const [pat, tz, off, dad, alt, sloppy, interval, startAt, stopAt, dayOffset, mode, ref, dir, n, maxRuns] = c;
   try {
@@ -185,7 +233,7 @@ const earlyYears = (runs: string) =>
 // historic local mean times, while many systems link zones like Europe/Stockholm to another zone)
 const before1900 = (runs: string) =>
   runs !== "-" && runs !== "ERR" && runs.split(",").every((r) => /^(0\d\d\d|1[0-8]\d\d)-/.test(r));
-let failures = 0, errors = 0, empty = 0, known = 0;
+let failures = 0, errors = 0, empty = 0, known = 0, fixed = 0;
 for (let i = 0; i < list.length; i++) {
   const js = runJs(list[i]);
   if (js === "ERR") errors++;
@@ -195,6 +243,8 @@ for (let i = 0; i < list.length; i++) {
     ((js === "-" && earlyYears(cpp[i])) || (before1900(js) && before1900(cpp[i])))
   ) {
     known++;
+  } else if (js !== cpp[i] && jsBugFixedInCpp(list[i], js, cpp[i])) {
+    fixed++;
   } else if (js !== cpp[i]) {
     failures++;
     if (failures <= 20) {
@@ -204,6 +254,74 @@ for (let i = 0; i < list.length; i++) {
 }
 console.log(
   `${list.length} cases, ${failures} mismatches (${errors} invalid, ${empty} without runs, ` +
-    `${known} known divergences in years before 1900)`,
+    `${known} known divergences in years before 1900, ${fixed} croner.js bugs fixed in C++)`,
 );
-process.exit(failures ? 1 : 0);
+
+// Optionally also compare with croner-rust (rust/ in this directory), for the cases it supports:
+// no interval, startAt, stopAt, dayOffset, maxRuns, utcOffset or mode, and a named time zone.
+let rustFailures = 0;
+const rustDriver = process.env.RUST_DRIVER;
+if (rustDriver) {
+  const eligible: number[] = [];
+  for (let i = 0; i < list.length; i++) {
+    const [, tz, off, , , , interval, startAt, stopAt, dayOffset, mode, , , , maxRuns] = list[i];
+    if (
+      tz !== "" && off === "" && interval === "0" && !startAt && !stopAt && dayOffset === "0" &&
+      mode === "auto" && maxRuns === ""
+    ) eligible.push(i);
+  }
+  const rin = eligible.map((i) => list[i].join("\t")).join("\n") + "\n";
+  const rres = spawnSync(rustDriver, [], { input: rin, maxBuffer: 1 << 30 });
+  if (rres.status !== 0) {
+    console.error("rust driver failed", rres.stderr?.toString());
+    process.exit(2);
+  }
+  const rust = rres.stdout.toString().trimEnd().split("\n");
+  // Expected differences between croner-rust and the C++ port (which follows croner.js):
+  // - croner-rust's parser is stricter: it rejects e.g. "*" inside lists ("*,5"), "2*" and "45?",
+  //   which croner.js accepts. It accepts a few that croner.js rejects (an empty list item,
+  //   steps larger than the field, "@weekly" with Quartz weekdays in croner.js 11.0.0).
+  // - Africa/Casablanca: chrono-tz bundles an older tzdata than the system database.
+  // - Year steps: croner-rust starts "*/n" at year 1, croner.js and the C++ port at year 0, so
+  //   "*/2" is even years as OCPS 1.4 section 4.3.2 requires.
+  // - croner-rust stops early in some cases, e.g. searching backwards over the day Samoa skipped
+  //   (Pacific/Apia, 2011-12-30). Its runs are then a prefix of the C++ runs.
+  // - After 2100, chrono-tz and the system database can disagree (Pacific/Chatham).
+  const counts = {
+    compared: 0, same: 0, rustRejects: 0, rustAccepts: 0, tzdata: 0, yearStep: 0, rustStops: 0,
+  };
+  const after2100 = (runs: string) => runs.split(",").some((r) => /^(21\d\d|2[2-9]\d\d)-/.test(r));
+  for (let k = 0; k < eligible.length; k++) {
+    const i = eligible[k];
+    if (rust[k] === "SKIP") continue;
+    counts.compared++;
+    const yearField = list[i][0].trim().split(/\s+/)[6] ?? "";
+    if (rust[k] === cpp[i]) counts.same++;
+    else if (rust[k] === "ERR") counts.rustRejects++;
+    else if (cpp[i] === "ERR") counts.rustAccepts++;
+    else if (list[i][1] === "Africa/Casablanca") counts.tzdata++;
+    else if (/(^|,)\*\/\d/.test(yearField)) counts.yearStep++;
+    else if (before1900(rust[k]) && before1900(cpp[i])) counts.tzdata++;
+    else if (cpp[i].startsWith(rust[k] + ",") || rust[k] === "-") counts.rustStops++;
+    else if (after2100(rust[k]) && after2100(cpp[i])) {
+      // Only a difference in runs after 2100 is a tzdata difference
+      const r = rust[k].split(","), c = cpp[i].split(",");
+      const first = r.findIndex((v, n) => v !== c[n]);
+      if (/^(21\d\d|2[2-9]\d\d)-/.test(r[first] ?? "")) counts.tzdata++;
+      else rustFailures++;
+    }
+    else {
+      rustFailures++;
+      if (rustFailures <= 20) {
+        console.log(`RUST MISMATCH #${i}: ${JSON.stringify(list[i])}\n  rust: ${rust[k]}\n  cpp : ${cpp[i]}`);
+      }
+    }
+  }
+  console.log(
+    `croner-rust: ${counts.compared} cases compared, ${counts.same} same, ${rustFailures} mismatches ` +
+      `(expected: ${counts.rustRejects} only rust rejects, ${counts.rustAccepts} only rust accepts, ` +
+      `${counts.tzdata} tzdata, ${counts.yearStep} year steps, ${counts.rustStops} rust stops early)`,
+  );
+}
+
+process.exit(failures || rustFailures ? 1 : 0);

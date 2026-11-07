@@ -1,0 +1,11 @@
+# Evaluates the differential test cases with croner-rust, see ../fuzz.ts (RUST_DRIVER).
+[package]
+name = "croner-rust-driver"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+croner = { git = "https://github.com/Hexagon/croner-rust", rev = "b31075eff1844c3812dee50b8c2840b409c57f16" }
+chrono = "0.4"
+chrono-tz = "0.10"

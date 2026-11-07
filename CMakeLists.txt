@@ -43,6 +43,9 @@ if(CRONER_BUILD_TESTS)
   add_executable(croner_differential_driver tests/differential/driver.cpp)
   target_link_libraries(croner_differential_driver PRIVATE croner::croner)
 
+  add_executable(croner_ocps_driver tests/ocps/driver.cpp)
+  target_link_libraries(croner_ocps_driver PRIVATE croner::croner)
+
   if(UNIX)
     add_executable(croner_tz_compare tests/tz_compare.cpp)
     target_link_libraries(croner_tz_compare PRIVATE croner::croner)

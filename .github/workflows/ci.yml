@@ -96,3 +96,50 @@ jobs:
         env:
           TZ: Europe/Stockholm
         run: npx tsx fuzz.ts ../../build/croner_differential_driver 20000 ${{ github.run_number }}
+
+  ocps:
+    name: OCPS conformance test vectors
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check out the OCPS specification
+        uses: actions/checkout@v7
+        with:
+          repository: open-source-cron/ocps
+          ref: df6f4c382182152b1809d38c86ab2935dfbdebf0
+          path: ocps
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24.x"
+      - name: Build driver
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target croner_ocps_driver
+      - name: Run conformance tests
+        working-directory: tests/differential
+        run: |
+          npm install
+          npx tsx ../ocps/ocps.ts ../../build/croner_ocps_driver ../../ocps
+
+  differential_rust:
+    name: Differential test against croner.js and croner-rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24.x"
+      - name: Build croner-rust driver
+        working-directory: tests/differential/rust
+        run: cargo build --release
+      - name: Build C++ driver
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target croner_differential_driver
+      - name: Compare
+        working-directory: tests/differential
+        env:
+          RUST_DRIVER: rust/target/release/croner-rust-driver
+        run: |
+          npm install
+          npx tsx fuzz.ts ../../build/croner_differential_driver 30000 ${{ github.run_number }}

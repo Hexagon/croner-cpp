@@ -134,6 +134,33 @@ TEST("alternative weekdays (Quartz)") {
   CHECK_EQ(iso(job.next_run("2024-01-01T00:00:00Z")), std::string("2024-01-08T00:00:00.000Z"));
 }
 
+TEST("days that don't exist in a month don't skip the start of the next month") {
+  // croner.js 11.0.0 tries February 31, rolls over to March 3, and skips March 1
+  CHECK_EQ(iso(Cron("0 0 1,31 * *", tz("Etc/UTC")).next_runs(3, "2025-02-02T00:00:00Z")),
+           (Strings{"2025-03-01T00:00:00.000Z", "2025-03-31T00:00:00.000Z",
+                    "2025-04-01T00:00:00.000Z"}));
+  CHECK_EQ(iso(Cron("0 0 */10 * *", tz("Etc/UTC")).next_runs(2, "2025-02-22T00:00:00Z")),
+           (Strings{"2025-03-01T00:00:00.000Z", "2025-03-11T00:00:00.000Z"}));
+  CHECK_EQ(iso(Cron("0 0 30 * *", tz("Etc/UTC")).next_run("2024-01-31T00:00:00Z")),
+           std::string("2024-03-30T00:00:00.000Z"));
+}
+
+TEST("@weekly with alternative weekdays is Sunday") {
+  Options o = tz("Etc/UTC");
+  o.alternative_weekdays = true;
+  Cron job("@weekly", o);
+  CHECK_EQ(iso(job.next_run("2025-10-01T00:00:00Z")), std::string("2025-10-05T00:00:00.000Z"));
+}
+
+TEST("year steps start from year 0, so */2 is even years (OCPS 1.4 4.3.2)") {
+  Cron job("0 0 0 1 1 * */2", tz("Etc/UTC"));
+  CHECK_EQ(iso(job.next_runs(2, "2025-06-01T00:00:00Z")),
+           (Strings{"2026-01-01T00:00:00.000Z", "2028-01-01T00:00:00.000Z"}));
+  Cron range("0 0 0 1 1 * 1970-2199/2", tz("Etc/UTC"));
+  CHECK(range.match("2026-01-01T00:00:00Z"));
+  CHECK(!range.match("2025-01-01T00:00:00Z"));
+}
+
 TEST("impossible patterns have no runs") {
   Cron job("0 0 30 2 *", tz("Etc/UTC"));
   CHECK(!job.next_run("2024-01-01T00:00:00Z"));

@@ -7,8 +7,10 @@
    the `croner` version pinned in `tests/differential/package.json`.
 2. Tag `v0.1.0` and publish a GitHub release. Users can then consume it right away with CMake
    `FetchContent`, CPM.cmake, or by copying the headers.
-3. Submit a **vcpkg** port and a **Conan Center** recipe. The name `croner` is free in both
-   (checked 2026-11-07). Start with vcpkg, which reviews faster.
+3. Submit a **vcpkg** port and a **Conan Center** recipe, both under the package name `croner`
+   (not `croner-cpp`), which is free in both (checked 2026-11-07). The CMake package and target
+   are `croner` / `croner::croner`, and the Conan recipe is already named `croner`. Start with
+   vcpkg, which reviews faster.
 4. Add a "C++" page to croner.56k.guru, and link it from the READMEs of the JavaScript and
    Rust versions.
 5. Later, if users ask for them: Meson WrapDB, xmake-repo, build2 (cppget.org), and Linux
@@ -41,8 +43,11 @@ scheduler with overrun protection.
 
 ## Checklist before 1.0 and the package manager submissions
 
-- [ ] CI green on Linux (GCC, Clang), macOS and Windows (MSVC C++20). The Windows path,
-      `std::chrono::tzdb` and `localtime_s`, has only been tested with libstdc++'s tzdb so far.
+- [x] CI green on Linux (GCC, Clang), macOS and Windows (MSVC C++20, `std::chrono::tzdb`).
+- [x] OCPS conformance test vectors, and differential tests against croner.js and croner-rust.
+- [ ] Fix the bugs found in croner.js (day rollover, `@weekly` with alternative weekdays, years
+      1-99) and croner-rust (`*/2` year parity, stopping early over Samoa's skipped day), so the
+      implementations agree again.
 - [ ] Decide on API names that are hard to change later: `croner::Cron`, `croner::Options`,
       snake_case methods, and `croner::TimePoint` with millisecond precision.
 - [ ] Decide whether job functions keep running on a thread per run, or whether to offer a

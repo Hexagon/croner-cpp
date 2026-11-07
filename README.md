@@ -3,8 +3,9 @@
 Trigger functions and/or evaluate cron expressions in C++. Header-only, C++17, no dependencies.
 
 A port of [Croner](https://github.com/Hexagon/croner) for JavaScript. It uses the same algorithms
-and gives the same results, which is checked by a differential test that runs random patterns,
-options, time zones and dates through both implementations.
+and gives the same results (apart from a few bugs fixed here, see below), which is checked by a
+differential test that runs random patterns, options, time zones and dates through croner.js,
+croner-rust and this port.
 
 - Follows the [Open Cron Pattern Standard](https://github.com/open-source-cron/ocps) (OCPS) 1.0
   to 1.4: seconds and year fields, `L`, `W`, `LW`, `#`, `?`, `+` (AND), nicknames such as
@@ -186,10 +187,41 @@ As in Croner for JavaScript and croner-rust, which deviate from OCPS 1.4 §4.3.1
 - Interval jobs (wildcard, step, range or list in second, minute or hour) run on both passes of a
   repeated hour, and skip times in a DST gap.
 
+## Year range
+
+The year field accepts 1-9999, wider than the OCPS standard range of 1970-2199. Steps from a
+wildcard are counted from year 0, so `*/2` matches even years, the same years as in the standard
+range (OCPS 1.4 section 4.3.2). Explicit ranges step from their start: `1971-2199/2` is odd years.
+Searches without a year field look at most 400 years ahead or back.
+
+## Standards and compatibility
+
+Checked in CI:
+
+- [OCPS](https://github.com/open-source-cron/ocps) conformance test vectors
+  (`tests/ocps/ocps.ts`): all pass, except three deliberate deviations shared with croner.js and
+  croner-rust: nicknames are case-insensitive (`@Daily`), `@reboot` is rejected when the pattern
+  is parsed (there is no startup event to run on), and `?` is accepted in every field as an alias
+  for `*`.
+- Results are compared with croner.js and croner-rust for random patterns, options, time zones
+  and dates (`tests/differential`). Expected differences with croner-rust are parsing
+  strictness (croner-rust rejects some patterns croner.js accepts, like `*,5`), tz data versions,
+  and two croner-rust issues: `*/2` in the year field matches odd years, and searches can stop
+  early around the day Samoa skipped in 2011.
+
 ## Differences from Croner for JavaScript
 
+Fixed here, but present in croner.js 11.0.0:
+
+- Days that don't exist in a month don't skip the first days of the next month. croner.js tries
+  e.g. February 31, rolls over to March 3, and so `0 0 1,31 * *` searched from February 2 skips
+  March 1.
+- `@weekly` works with `alternative_weekdays` (croner.js rejects it, as it expands to `0`).
 - Years 1-99 in the year field work. In JavaScript, `Date.UTC()` reads them as 1900-1999, so they
   never match.
+
+Other differences:
+
 - A date-only string, `"2025-01-01"`, is midnight in the job's time zone. JavaScript reads it as
   UTC midnight.
 - Time zone names are looked up in the zoneinfo database, where they are case-sensitive
@@ -210,6 +242,15 @@ cmake -S . -B build && cmake --build build && ctest --test-dir build
   ```sh
   cd tests/differential && npm install
   npx tsx fuzz.ts ../../build/croner_differential_driver 50000
+  ```
+
+  Set `RUST_DRIVER` to also compare with croner-rust (`cargo build --release` in
+  `tests/differential/rust`).
+- `tests/ocps`, runs the OCPS conformance test vectors. They are not copied into this repository
+  (they are licensed CC BY-SA 4.0), pass the path of an OCPS checkout:
+
+  ```sh
+  npx tsx tests/ocps/ocps.ts build/croner_ocps_driver path/to/ocps
   ```
 
 - `tests/tz_compare.cpp`, compares the zoneinfo reader with the C library for every zone.
