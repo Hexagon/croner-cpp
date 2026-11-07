@@ -1,5 +1,7 @@
 # Croner for C++
 
+Croner is available for [JavaScript/TypeScript](https://github.com/Hexagon/croner) · [Rust](https://github.com/Hexagon/croner-rust) · [Python](https://github.com/Hexagon/croner-py) · [.NET](https://github.com/Hexagon/croner-dotnet) · **C++**
+
 Trigger functions and/or evaluate cron expressions in C++. Header-only, C++17, no dependencies.
 
 A port of [Croner](https://github.com/Hexagon/croner) for JavaScript. It uses the same algorithms
