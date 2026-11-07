@@ -255,6 +255,16 @@ cmake -S . -B build && cmake --build build && ctest --test-dir build
 
 - `tests/tz_compare.cpp`, compares the zoneinfo reader with the C library for every zone.
 
+## Other implementations
+
+Croner is available in several languages. The implementations share pattern syntax, DST rules and test cases:
+
+- **JavaScript / TypeScript**: [croner](https://github.com/Hexagon/croner), Node, Deno, Bun and browsers, on [npm](https://www.npmjs.com/package/croner) and [JSR](https://jsr.io/@hexagon/croner)
+- **Rust**: [croner-rust](https://github.com/Hexagon/croner-rust), on [crates.io](https://crates.io/crates/croner)
+- **Python**: [croner-py](https://github.com/Hexagon/croner-py), on [PyPI](https://pypi.org/project/croner/)
+- **.NET**: [croner-dotnet](https://github.com/Hexagon/croner-dotnet), on [NuGet](https://www.nuget.org/packages/Croner)
+- **C++**: croner-cpp (this repository)
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
