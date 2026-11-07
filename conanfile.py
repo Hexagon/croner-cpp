@@ -1,12 +1,13 @@
 from conan import ConanFile
-from conan.tools.cmake import CMake, cmake_layout
+from conan.tools.build import check_min_cppstd
+from conan.tools.cmake import cmake_layout
 from conan.tools.files import copy
 import os
 
 
 class CronerConan(ConanFile):
     name = "croner"
-    version = "0.1.0"
+    version = "0.2.0"
     license = "MIT"
     url = "https://github.com/Hexagon/croner-cpp"
     homepage = "https://croner.56k.guru"
@@ -20,6 +21,9 @@ class CronerConan(ConanFile):
 
     def layout(self):
         cmake_layout(self)
+
+    def validate(self):
+        check_min_cppstd(self, 17)
 
     def package_id(self):
         self.info.clear()

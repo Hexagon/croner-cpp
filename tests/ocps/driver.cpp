@@ -13,11 +13,12 @@ int main() {
     const auto t1 = line.find('\t');
     const std::string kind = line.substr(0, t1);
     const auto t2 = line.find('\t', t1 + 1);
-    const std::string pattern = line.substr(t1 + 1, t2 == std::string::npos ? std::string::npos : t2 - t1 - 1);
+    const std::string pattern =
+        line.substr(t1 + 1, t2 == std::string::npos ? std::string::npos : t2 - t1 - 1);
     try {
-      croner::Options o;
-      o.timezone = "Etc/UTC";
-      croner::Cron job(pattern, o);
+      croner::CronOptions o;
+      o.zone = croner::utc_zone();
+      const croner::Cron job(pattern, o);
       if (kind == "parse") {
         std::cout << "accept\n";
       } else {

@@ -1,11 +1,12 @@
 // Croner for C++ - MIT License - Hexagon <github.com/Hexagon>
 //
-// Cron pattern parser, a port of src/pattern.ts
+// Cron pattern parser. Turns a pattern into one set of allowed values per field.
 
 #ifndef CRONER_PATTERN_HPP
 #define CRONER_PATTERN_HPP
 
 #include <array>
+#include <bitset>
 #include <cctype>
 #include <cstdint>
 #include <optional>
@@ -14,25 +15,29 @@
 #include <utility>
 #include <vector>
 
-#include "timezone.hpp"
+#include "error.hpp"
 
 namespace croner {
 
-/// Cron pattern mode, controls which pattern lengths are accepted.
+/// Which pattern lengths are accepted.
 enum class Mode {
-  Auto,             ///< 5, 6 or 7 parts
-  FivePart,         ///< minute precision, seconds forced to 0, years wildcarded
-  SixPart,          ///< second precision, years wildcarded
-  SevenPart,        ///< second and year precision
-  FiveOrSixParts,   ///< 5 or 6 parts, years wildcarded
-  SixOrSevenParts,  ///< 6 or 7 parts
+  Auto,             ///< 5, 6 or 7 fields
+  FivePart,         ///< 5 fields only. Seconds are always 0 and any year matches.
+  SixPart,          ///< 6 fields only. Any year matches.
+  SevenPart,        ///< 7 fields only
+  FiveOrSixParts,   ///< 5 or 6 fields. Any year matches.
+  SixOrSevenParts,  ///< 6 or 7 fields
 };
 
-/// Bitmasks for nth weekday of month (FRI#2) and last weekday of month (FRIL)
+namespace detail {
+
+/// Bitmasks for the nth weekday of the month (FRI#2) and the last one (FRIL)
 inline constexpr std::uint8_t LAST_OCCURRENCE = 0b100000;
 inline constexpr std::uint8_t ANY_OCCURRENCE = 0b111111;
 inline constexpr std::uint8_t OCCURRENCE_BITMASKS[5] = {0b00001, 0b00010, 0b00100, 0b01000,
-                                                       0b10000};
+                                                        0b10000};
+
+inline constexpr int MAX_YEAR = 9999;
 
 /// Options affecting how a pattern is parsed
 struct PatternOptions {
@@ -45,64 +50,69 @@ struct PatternOptions {
 
 /// A parsed cron pattern.
 ///
-/// Each field is an array of flags, 1 if the value is part of the pattern. Days and months are
-/// stored with index 0 being the 1st and January. day_of_week holds a bitmask of which
+/// Each field is a set of the values that match. Days of month and months are stored with
+/// index 0 being the 1st and January. day_of_week holds, per weekday, a bitmask of which
 /// occurrences in the month match (ANY_OCCURRENCE for all).
 class CronPattern {
  public:
+  /// The pattern, with nicknames such as "@daily" expanded
   std::string pattern;
-  Mode mode;
-  bool alternative_weekdays;
-  bool sloppy_ranges;
 
-  std::array<std::uint8_t, 60> second{};
-  std::array<std::uint8_t, 60> minute{};
-  std::array<std::uint8_t, 24> hour{};
-  std::array<std::uint8_t, 31> day{};
-  std::array<std::uint8_t, 12> month{};
+  std::bitset<60> second;
+  std::bitset<60> minute;
+  std::bitset<24> hour;
+  std::bitset<31> day;
+  std::bitset<12> month;
   std::array<std::uint8_t, 7> day_of_week{};
-  std::vector<std::uint8_t> year = std::vector<std::uint8_t>(10000, 0);  // index = year
-  std::array<std::uint8_t, 31> nearest_weekdays{};
+  std::bitset<MAX_YEAR + 1> year;  // index = year
+  std::bitset<31> nearest_weekdays;
 
   bool last_day_of_month = false;
   bool last_weekday = false;
   bool star_dom = false;
   bool star_dow = false;
   bool star_year = false;
-  /// OCPS 1.4 "+" modifier in day-of-week, AND day-of-month and day-of-week
+  /// "+" in day-of-week: day-of-month AND day-of-week
   bool use_and_logic = false;
   /// Seconds, minutes and hours each have a single value, without wildcard or step
   bool is_fixed_time = false;
 
   /// @throws CronError on invalid patterns
-  explicit CronPattern(std::string pattern_in, PatternOptions options = {})
-      : pattern(std::move(pattern_in)),
-        mode(options.mode),
-        alternative_weekdays(options.alternative_weekdays),
-        sloppy_ranges(options.sloppy_ranges) {
+  explicit CronPattern(std::string_view pattern_in, PatternOptions options = {})
+      : pattern(pattern_in), options_(options) {
     parse();
   }
 
  private:
+  PatternOptions options_;
+
   enum class Part { Second, Minute, Hour, Day, Month, DayOfWeek, NearestWeekdays, Year };
 
-  struct Field {
-    std::uint8_t* data;
-    int length;
-  };
-
-  Field field(Part p) {
+  static int length(Part p) {
     switch (p) {
-      case Part::Second: return {second.data(), 60};
-      case Part::Minute: return {minute.data(), 60};
-      case Part::Hour: return {hour.data(), 24};
-      case Part::Day: return {day.data(), 31};
-      case Part::Month: return {month.data(), 12};
-      case Part::DayOfWeek: return {day_of_week.data(), 7};
-      case Part::NearestWeekdays: return {nearest_weekdays.data(), 31};
-      case Part::Year: return {year.data(), 10000};
+      case Part::Second:
+      case Part::Minute: return 60;
+      case Part::Hour: return 24;
+      case Part::Day:
+      case Part::NearestWeekdays: return 31;
+      case Part::Month: return 12;
+      case Part::DayOfWeek: return 7;
+      case Part::Year: return MAX_YEAR + 1;
     }
-    return {nullptr, 0};
+    return 0;
+  }
+
+  void set_bit(Part p, std::size_t i) {
+    switch (p) {
+      case Part::Second: second.set(i); break;
+      case Part::Minute: minute.set(i); break;
+      case Part::Hour: hour.set(i); break;
+      case Part::Day: day.set(i); break;
+      case Part::Month: month.set(i); break;
+      case Part::NearestWeekdays: nearest_weekdays.set(i); break;
+      case Part::Year: year.set(i); break;
+      case Part::DayOfWeek: day_of_week[i] = ANY_OCCURRENCE; break;
+    }
   }
 
   static const char* part_name(Part p) {
@@ -110,16 +120,18 @@ class CronPattern {
       case Part::Second: return "second";
       case Part::Minute: return "minute";
       case Part::Hour: return "hour";
-      case Part::Day: return "day";
+      case Part::Day: return "day of month";
       case Part::Month: return "month";
-      case Part::DayOfWeek: return "dayOfWeek";
-      case Part::NearestWeekdays: return "nearestWeekdays";
+      case Part::DayOfWeek: return "day of week";
+      case Part::NearestWeekdays: return "nearest weekday";
       case Part::Year: return "year";
     }
     return "";
   }
 
-  [[noreturn]] static void fail(const std::string& msg) { throw CronError("CronPattern: " + msg); }
+  [[noreturn]] void fail(const std::string& msg) const {
+    throw CronError(CronError::Kind::Pattern, "invalid cron pattern '" + pattern + "': " + msg);
+  }
 
   static std::string to_upper(std::string s) {
     for (auto& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
@@ -152,8 +164,8 @@ class CronPattern {
     }
   }
 
-  /// JavaScript parseInt(s, 10): leading whitespace, optional sign, digits until the first
-  /// non-digit. nullopt (NaN) if there are no digits. Saturates instead of overflowing.
+  /// Leading whitespace, an optional sign, then digits up to the first non-digit. nullopt if
+  /// there are no digits. Saturates instead of overflowing.
   static std::optional<std::int64_t> parse_int(std::string_view s) {
     std::size_t i = 0;
     while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) ++i;
@@ -198,8 +210,8 @@ class CronPattern {
   }
 
   void parse() {
-    // Handle @yearly, @monthly etc
-    if (contains(pattern, '@')) pattern = trim(handle_nicknames(pattern, alternative_weekdays));
+    // @yearly, @monthly etc
+    if (contains(pattern, '@')) pattern = trim(expand_nickname(pattern));
 
     // Split on any whitespace
     std::vector<std::string> parts;
@@ -216,17 +228,27 @@ class CronPattern {
     const std::size_t original_count = parts.size();
 
     if (parts.size() < 5 || parts.size() > 7) {
-      fail("invalid configuration format ('" + pattern +
-           "'), exactly five, six, or seven space separated parts are required.");
+      fail("expected 5, 6 or 7 fields separated by whitespace, got " +
+           std::to_string(original_count));
     }
 
+    const Mode mode = options_.mode;
     if (mode != Mode::Auto) {
       bool valid = false;
-      std::string expected;
+      const char* expected = "";
       switch (mode) {
-        case Mode::FivePart: valid = original_count == 5; expected = "5"; break;
-        case Mode::SixPart: valid = original_count == 6; expected = "6"; break;
-        case Mode::SevenPart: valid = original_count == 7; expected = "7"; break;
+        case Mode::FivePart:
+          valid = original_count == 5;
+          expected = "5";
+          break;
+        case Mode::SixPart:
+          valid = original_count == 6;
+          expected = "6";
+          break;
+        case Mode::SevenPart:
+          valid = original_count == 7;
+          expected = "7";
+          break;
         case Mode::FiveOrSixParts:
           valid = original_count == 5 || original_count == 6;
           expected = "5 or 6";
@@ -238,18 +260,16 @@ class CronPattern {
         case Mode::Auto: break;
       }
       if (!valid) {
-        fail("mode '" + mode_name(mode) + "' requires exactly " + expected +
-             " parts, but pattern '" + pattern + "' has " + std::to_string(original_count) +
-             " parts.");
+        fail(std::string("mode requires ") + expected + " fields, got " +
+             std::to_string(original_count));
       }
     }
 
-    // If seconds is omitted, insert 0 for seconds
+    // Without seconds, seconds are 0. Without a year, any year matches.
     if (parts.size() == 5) parts.insert(parts.begin(), "0");
-    // If year is omitted, append * for year
     if (parts.size() == 6) parts.emplace_back("*");
 
-    // OCPS 1.4: '?' is an alias for '*'
+    // '?' is an alias for '*'
     if (contains(pattern, '?')) {
       for (auto& p : parts)
         for (auto& c : p)
@@ -271,254 +291,240 @@ class CronPattern {
     if (parts[3] == "*") star_dom = true;
     if (parts[6] == "*") star_year = true;
 
-    // Replace alpha representations
+    // Names of months and weekdays
     static const std::array<std::pair<const char*, const char*>, 12> month_names = {{
-        {"jan", "1"}, {"feb", "2"}, {"mar", "3"}, {"apr", "4"}, {"may", "5"}, {"jun", "6"},
-        {"jul", "7"}, {"aug", "8"}, {"sep", "9"}, {"oct", "10"}, {"nov", "11"}, {"dec", "12"},
+        {"jan", "1"},
+        {"feb", "2"},
+        {"mar", "3"},
+        {"apr", "4"},
+        {"may", "5"},
+        {"jun", "6"},
+        {"jul", "7"},
+        {"aug", "8"},
+        {"sep", "9"},
+        {"oct", "10"},
+        {"nov", "11"},
+        {"dec", "12"},
     }};
     // "-sun" must come before "sun": Sunday as the upper value of a range is 7
     static const std::array<std::pair<const char*, const char*>, 8> day_names = {{
-        {"-sun", "-7"}, {"sun", "0"}, {"mon", "1"}, {"tue", "2"},
-        {"wed", "3"}, {"thu", "4"}, {"fri", "5"}, {"sat", "6"},
+        {"-sun", "-7"},
+        {"sun", "0"},
+        {"mon", "1"},
+        {"tue", "2"},
+        {"wed", "3"},
+        {"thu", "4"},
+        {"fri", "5"},
+        {"sat", "6"},
     }};
     static const std::array<std::pair<const char*, const char*>, 7> day_names_quartz = {{
-        {"sun", "1"}, {"mon", "2"}, {"tue", "3"}, {"wed", "4"},
-        {"thu", "5"}, {"fri", "6"}, {"sat", "7"},
+        {"sun", "1"},
+        {"mon", "2"},
+        {"tue", "3"},
+        {"wed", "4"},
+        {"thu", "5"},
+        {"fri", "6"},
+        {"sat", "7"},
     }};
     if (parts[4].size() >= 3) parts[4] = replace_alpha(parts[4], month_names);
     if (parts[5].size() >= 3) {
-      parts[5] = alternative_weekdays ? replace_alpha(parts[5], day_names_quartz)
-                                      : replace_alpha(parts[5], day_names);
+      parts[5] = options_.alternative_weekdays ? replace_alpha(parts[5], day_names_quartz)
+                                               : replace_alpha(parts[5], day_names);
     }
 
-    // OCPS 1.4: "+" in day-of-week for AND logic
+    // "+" in day-of-week: AND with day-of-month
     if (!parts[5].empty() && parts[5][0] == '+') {
       use_and_logic = true;
       parts[5] = parts[5].substr(1);
-      if (parts[5].empty()) fail("Day-of-week field cannot be empty after '+' modifier.");
+      if (parts[5].empty()) fail("the day of week field is empty after '+'");
     }
 
     if (parts[5] == "*") star_dow = true;
 
-    // Mode specific overrides
     switch (mode) {
       case Mode::FivePart:
         parts[0] = "0";
         parts[6] = "*";
         break;
       case Mode::SixPart:
-      case Mode::FiveOrSixParts:
-        parts[6] = "*";
-        break;
-      default:
-        break;
+      case Mode::FiveOrSixParts: parts[6] = "*"; break;
+      default: break;
     }
 
-    throw_at_illegal_characters(parts);
+    check_characters(parts);
 
-    part_to_array(Part::Second, parts[0], 0, 1);
-    part_to_array(Part::Minute, parts[1], 0, 1);
-    part_to_array(Part::Hour, parts[2], 0, 1);
-    part_to_array(Part::Day, parts[3], -1, 1);
-    part_to_array(Part::Month, parts[4], -1, 1);
-    part_to_array(Part::DayOfWeek, parts[5], alternative_weekdays ? -1 : 0, ANY_OCCURRENCE);
-    part_to_array(Part::Year, parts[6], 0, 1);
+    part_to_set(Part::Second, parts[0], 0);
+    part_to_set(Part::Minute, parts[1], 0);
+    part_to_set(Part::Hour, parts[2], 0);
+    part_to_set(Part::Day, parts[3], -1);
+    part_to_set(Part::Month, parts[4], -1);
+    part_to_set(Part::DayOfWeek, parts[5], options_.alternative_weekdays ? -1 : 0);
+    part_to_set(Part::Year, parts[6], 0);
 
-    const auto is_fixed = [](const std::string& part, const auto& values) {
-      if (contains(part, '*') || contains(part, '/')) return false;
-      int n = 0;
-      for (auto v : values)
-        if (v) ++n;
-      return n == 1;
+    const auto is_fixed = [](const std::string& part, std::size_t count) {
+      return !contains(part, '*') && !contains(part, '/') && count == 1;
     };
-    is_fixed_time =
-        is_fixed(parts[0], second) && is_fixed(parts[1], minute) && is_fixed(parts[2], hour);
+    is_fixed_time = is_fixed(parts[0], second.count()) && is_fixed(parts[1], minute.count()) &&
+                    is_fixed(parts[2], hour.count());
   }
 
-  static std::string mode_name(Mode m) {
-    switch (m) {
-      case Mode::Auto: return "auto";
-      case Mode::FivePart: return "5-part";
-      case Mode::SixPart: return "6-part";
-      case Mode::SevenPart: return "7-part";
-      case Mode::FiveOrSixParts: return "5-or-6-parts";
-      case Mode::SixOrSevenParts: return "6-or-7-parts";
-    }
-    return "";
-  }
-
-  void part_to_array(Part type, const std::string& conf, int offset, int default_value) {
+  void part_to_set(Part type, const std::string& conf, int offset) {
     if (conf.empty() && !(type == Part::Day && (last_day_of_month || last_weekday))) {
-      fail(std::string("configuration entry ") + part_name(type) + " (" + conf +
-           ") is empty, check for trailing spaces.");
+      fail(std::string("the ") + part_name(type) + " field is empty");
     }
 
     if (conf == "*") {
-      const Field f = field(type);
-      for (int i = 0; i < f.length; ++i) f.data[i] = static_cast<std::uint8_t>(default_value);
+      for (int i = 0; i < length(type); ++i) set_bit(type, static_cast<std::size_t>(i));
       return;
     }
 
     const auto items = split(conf, ',');
     if (items.size() > 1) {
-      for (const auto& item : items) part_to_array(type, item, offset, default_value);
+      for (const auto& item : items) part_to_set(type, item, offset);
     } else if (contains(conf, '-') && contains(conf, '/')) {
-      handle_range_with_stepping(conf, type, offset, default_value);
+      handle_range_with_stepping(conf, type, offset);
     } else if (contains(conf, '-')) {
-      handle_range(conf, type, offset, default_value);
+      handle_range(conf, type, offset);
     } else if (contains(conf, '/')) {
-      handle_stepping(conf, type, offset, default_value);
+      handle_stepping(conf, type, offset);
     } else if (!conf.empty()) {
-      handle_number(conf, type, offset, default_value);
+      handle_number(conf, type, offset);
     }
   }
 
-  static void throw_at_illegal_characters(const std::vector<std::string>& parts) {
+  void check_characters(const std::vector<std::string>& parts) const {
+    static const char* const names[] = {"second", "minute",      "hour", "day of month",
+                                        "month",  "day of week", "year"};
     for (std::size_t i = 0; i < parts.size(); ++i) {
       for (char c : parts[i]) {
         bool ok = c == '/' || c == '*' || (c >= '0' && c <= '9') || c == ',' || c == '-';
         if (i == 3) ok = ok || c == 'W' || c == 'w' || c == 'L' || c == 'l';
         if (i == 5) ok = ok || c == '#' || c == 'L' || c == 'l';
         if (!ok) {
-          fail("configuration entry " + std::to_string(i) + " (" + parts[i] +
-               ") contains illegal characters.");
+          fail(std::string("unexpected character '") + c + "' in the " + names[i] + " field");
         }
       }
     }
   }
 
-  // The nth modifier of a value: nullopt or empty for none, otherwise "L" or a number
+  // The nth modifier of a weekday: nullopt for none, otherwise "L" or a number
   using Nth = std::optional<std::string>;
 
-  void handle_number(const std::string& conf, Part type, int offset, int default_value) {
+  void handle_number(const std::string& conf, Part type, int offset) {
     const auto [rest, nth] = extract_nth(conf, type);
     const bool nearest = contains(to_upper(conf), 'W');
-    if (type != Part::Day && nearest) {
-      fail("Nearest weekday modifier (W) only allowed in day-of-month.");
-    }
+    if (type != Part::Day && nearest) fail("W is only allowed in the day of month field");
     if (nearest) type = Part::NearestWeekdays;
     const auto v = parse_int(rest);
-    if (!v) fail(std::string(part_name(type)) + " is not a number: '" + conf + "'");
-    set_part(type, *v + offset, nth, default_value);
+    if (!v)
+      fail(std::string("'") + conf + "' in the " + part_name(type) + " field is not a number");
+    set_part(type, *v + offset, nth);
   }
 
-  void set_part(Part part, std::int64_t index, const Nth& nth, int default_value) {
+  void set_part(Part part, std::int64_t index, const Nth& nth) {
     if (part == Part::DayOfWeek) {
       if (index == 7) index = 0;
       if (index < 0 || index > 6) {
-        fail("Invalid value for dayOfWeek: " + std::to_string(index));
+        fail("day of week " + std::to_string(index - (options_.alternative_weekdays ? -1 : 0)) +
+             " is out of range");
       }
-      set_nth_weekday_of_month(static_cast<int>(index), nth, default_value);
+      set_nth_weekday_of_month(static_cast<std::size_t>(index), nth);
       return;
     }
-    std::int64_t lo = 0, hi = 0;
-    switch (part) {
-      case Part::Second:
-      case Part::Minute: hi = 60; break;
-      case Part::Hour: hi = 24; break;
-      case Part::Day:
-      case Part::NearestWeekdays: hi = 31; break;
-      case Part::Month: hi = 12; break;
-      case Part::Year: lo = 1; hi = 10000; break;
-      default: break;
+    const std::int64_t lo = part == Part::Year ? 1 : 0;
+    if (index < lo || index >= length(part)) {
+      const int display_offset =
+          part == Part::Day || part == Part::NearestWeekdays || part == Part::Month ? 1 : 0;
+      fail(std::string(part_name(part)) + " " + std::to_string(index + display_offset) +
+           " is out of range" + (part == Part::Year ? " (1-9999)" : ""));
     }
-    if (index < lo || index >= hi) {
-      fail("Invalid value for " + std::string(part_name(part)) + ": " + std::to_string(index) +
-           (part == Part::Year ? " (supported range: 1-9999)" : ""));
-    }
-    field(part).data[index] = static_cast<std::uint8_t>(default_value);
+    set_bit(part, static_cast<std::size_t>(index));
   }
 
   void validate_range(std::int64_t lower, std::int64_t upper, std::optional<std::int64_t> steps,
-                      Part type, const std::string& conf) {
-    if (lower > upper) fail("From value is larger than to value: '" + conf + "'");
+                      Part type, const std::string& conf) const {
+    if (lower > upper) fail("the range '" + conf + "' starts after it ends");
     if (steps) {
-      if (*steps == 0) fail("Syntax error, illegal stepping: 0");
-      if (*steps > field(type).length) {
-        fail("Syntax error, steps cannot be greater than maximum value of part (" +
-             std::to_string(field(type).length) + ")");
+      if (*steps == 0) fail("a step of 0 in '" + conf + "'");
+      if (*steps > length(type)) {
+        fail("the step in '" + conf + "' is larger than the " + part_name(type) + " field (" +
+             std::to_string(length(type)) + ")");
       }
     }
   }
 
-  void handle_range_with_stepping(const std::string& conf, Part type, int offset,
-                                  int default_value) {
-    if (contains(to_upper(conf), 'W')) fail("Syntax error, W is not allowed in ranges with stepping.");
+  static bool is_digits(std::string_view s) {
+    if (s.empty()) return false;
+    for (char c : s)
+      if (c < '0' || c > '9') return false;
+    return true;
+  }
+
+  void handle_range_with_stepping(const std::string& conf, Part type, int offset) {
+    if (contains(to_upper(conf), 'W')) fail("W is not allowed in a range with a step");
     const auto [rest, nth] = extract_nth(conf, type);
 
     // ^(\d+)-(\d+)\/(\d+)$
-    const auto is_digits = [](std::string_view s) {
-      if (s.empty()) return false;
-      for (char c : s)
-        if (c < '0' || c > '9') return false;
-      return true;
-    };
     const std::size_t dash = rest.find('-');
     const std::size_t slash = rest.find('/');
     if (dash == std::string::npos || slash == std::string::npos || slash < dash ||
         !is_digits(std::string_view(rest).substr(0, dash)) ||
         !is_digits(std::string_view(rest).substr(dash + 1, slash - dash - 1)) ||
         !is_digits(std::string_view(rest).substr(slash + 1))) {
-      fail("Syntax error, illegal range with stepping: '" + conf + "'");
+      fail("'" + conf + "' is not a valid range with a step (from-to/step)");
     }
     const std::int64_t lower = *parse_int(rest.substr(0, dash)) + offset;
     const std::int64_t upper = *parse_int(rest.substr(dash + 1, slash - dash - 1)) + offset;
     const std::int64_t steps = *parse_int(rest.substr(slash + 1));
 
     validate_range(lower, upper, steps, type, conf);
-    for (std::int64_t i = lower; i <= upper; i += steps) set_part(type, i, nth, default_value);
+    for (std::int64_t i = lower; i <= upper; i += steps) set_part(type, i, nth);
   }
 
-  /// Break out nth weekday (#) or last occurrence (L), only allowed in day-of-week
-  static std::pair<std::string, Nth> extract_nth(const std::string& conf, Part type) {
+  /// Split off the nth weekday (#n) or last occurrence (L), only allowed in day-of-week
+  std::pair<std::string, Nth> extract_nth(const std::string& conf, Part type) const {
     if (contains(conf, '#')) {
-      if (type != Part::DayOfWeek) {
-        throw CronError("CronPattern: nth (#) only allowed in day-of-week field");
-      }
+      if (type != Part::DayOfWeek) fail("# is only allowed in the day of week field");
       const auto pieces = split(conf, '#');
+      if (pieces.size() != 2 || pieces[1].empty()) {
+        fail("'" + conf + "' is not a valid nth weekday (weekday#n)");
+      }
       return {pieces[0], pieces[1]};
     }
     if (!conf.empty() && (conf.back() == 'L' || conf.back() == 'l')) {
       if (type != Part::DayOfWeek) {
-        throw CronError(
-            "CronPattern: L modifier only allowed in day-of-week field (use L alone for "
-            "day-of-month)");
+        fail(
+            "L after a value is only allowed in the day of week field (use L alone for the "
+            "last day of the month)");
       }
       return {conf.substr(0, conf.size() - 1), std::string("L")};
     }
     return {conf, std::nullopt};
   }
 
-  void handle_range(const std::string& conf, Part type, int offset, int default_value) {
-    if (contains(to_upper(conf), 'W')) fail("Syntax error, W is not allowed in a range.");
+  void handle_range(const std::string& conf, Part type, int offset) {
+    if (contains(to_upper(conf), 'W')) fail("W is not allowed in a range");
     const auto [rest, nth] = extract_nth(conf, type);
     const auto pieces = split(rest, '-');
-    if (pieces.size() != 2) fail("Syntax error, illegal range: '" + conf + "'");
+    if (pieces.size() != 2) fail("'" + conf + "' is not a valid range (from-to)");
     const auto lo = parse_int(pieces[0]);
     const auto hi = parse_int(pieces[1]);
-    if (!lo) fail("Syntax error, illegal lower range (NaN)");
-    if (!hi) fail("Syntax error, illegal upper range (NaN)");
+    if (!lo || !hi) fail("'" + conf + "' is not a valid range (from-to)");
     const std::int64_t lower = *lo + offset, upper = *hi + offset;
     validate_range(lower, upper, std::nullopt, type, conf);
-    for (std::int64_t i = lower; i <= upper; ++i) set_part(type, i, nth, default_value);
+    for (std::int64_t i = lower; i <= upper; ++i) set_part(type, i, nth);
   }
 
-  void handle_stepping(const std::string& conf, Part type, int offset, int default_value) {
-    if (contains(to_upper(conf), 'W')) {
-      fail("Syntax error, W is not allowed in parts with stepping.");
-    }
+  void handle_stepping(const std::string& conf, Part type, int offset) {
+    if (contains(to_upper(conf), 'W')) fail("W is not allowed with a step");
     const auto [rest, nth] = extract_nth(conf, type);
     auto pieces = split(rest, '/');
-    if (pieces.size() != 2) fail("Syntax error, illegal stepping: '" + conf + "'");
+    if (pieces.size() != 2) fail("'" + conf + "' is not a valid step (*/step)");
 
-    if (!sloppy_ranges) {
-      if (pieces[0].empty()) {
-        fail("Syntax error, stepping with missing prefix ('" + conf +
-             "') is not allowed. Use wildcard (*/step) or range (min-max/step) instead.");
-      }
+    if (!options_.sloppy_ranges) {
       if (pieces[0] != "*") {
-        fail("Syntax error, stepping with numeric prefix ('" + conf +
-             "') is not allowed. Use wildcard (*/step) or range (min-max/step) instead.");
+        fail("'" + conf + "' steps from " + (pieces[0].empty() ? "nothing" : "a single value") +
+             ", use */step or from-to/step (or enable sloppy_ranges)");
       }
     } else if (pieces[0].empty()) {
       pieces[0] = "*";
@@ -527,28 +533,24 @@ class CronPattern {
     std::int64_t start = 0;
     if (pieces[0] != "*") {
       const auto s = parse_int(pieces[0]);
-      // NaN start never enters the loop in JavaScript
-      if (!s) start = field(type).length;
-      else start = *s + offset;
+      start = s ? *s + offset : length(type);  // not a number: no values
     }
 
     const auto steps = parse_int(pieces[1]);
-    if (!steps) fail("Syntax error, illegal stepping: (NaN)");
-    const int length = field(type).length;
-    validate_range(0, length - 1, *steps, type, conf);
+    if (!steps) fail("'" + conf + "' is not a valid step (*/step)");
+    const int len = length(type);
+    validate_range(0, len - 1, *steps, type, conf);
 
-    for (std::int64_t i = start; i < length; i += *steps) {
+    for (std::int64_t i = start; i < len; i += *steps) {
       if (type == Part::Year && i == 0) continue;  // There is no year 0
-      set_part(type, i, nth, default_value);
+      set_part(type, i, nth);
     }
   }
 
-  static std::string handle_nicknames(const std::string& p, bool quartz_weekdays) {
+  std::string expand_nickname(const std::string& p) const {
     const std::string clean = to_lower(trim(p));
     if (clean == "@reboot") {
-      fail(
-          "@reboot is not supported in this environment. This is an event-based trigger that "
-          "requires system startup detection.");
+      fail("@reboot is not supported, there is no startup event to run on");
     }
     static const std::array<std::pair<const char*, const char*>, 7> nicknames = {{
         {"@yearly", "0 0 1 1 *"},
@@ -559,46 +561,39 @@ class CronPattern {
         {"@midnight", "0 0 * * *"},
         {"@hourly", "0 * * * *"},
     }};
-    // Sunday is 1 with Quartz weekday numbering (croner.js rejects @weekly in that mode)
-    if (clean == "@weekly" && quartz_weekdays) return "0 0 * * 1";
+    // Sunday is 1 with Quartz weekday numbering
+    if (clean == "@weekly" && options_.alternative_weekdays) return "0 0 * * 1";
     for (const auto& [name, value] : nicknames)
       if (clean == name) return value;
     return p;
   }
 
-  void set_nth_weekday_of_month(int index, const Nth& nth, int default_value) {
-    auto& v = day_of_week[static_cast<std::size_t>(index)];
-    if (!nth || nth->empty()) {
-      // Default value, ANY_OCCURRENCE
-      if (default_value == ANY_OCCURRENCE) {
-        v = ANY_OCCURRENCE;
-        return;
-      }
-      fail("nth weekday out of range, should be 1-5 or L. Value: " +
-           std::to_string(default_value));
+  void set_nth_weekday_of_month(std::size_t index, const Nth& nth) {
+    auto& v = day_of_week[index];
+    if (!nth) {
+      v = ANY_OCCURRENCE;
+      return;
     }
     if (to_upper(*nth) == "L") {
       v = static_cast<std::uint8_t>(v | LAST_OCCURRENCE);
       return;
     }
-    // Number(nth) must be an integer 1-5
-    bool numeric = true;
+    // A number 1-5
     std::int64_t n = 0;
-    for (char c : *nth) {
-      if (c < '0' || c > '9') {
-        numeric = false;
-        break;
-      }
-      if (n < 1000) n = n * 10 + (c - '0');
+    const bool numeric = is_digits(*nth);
+    if (numeric) {
+      for (char c : *nth)
+        if (n < 1000) n = n * 10 + (c - '0');
     }
     if (numeric && n > 0 && n < 6) {
       v = static_cast<std::uint8_t>(v | OCCURRENCE_BITMASKS[n - 1]);
       return;
     }
-    fail("nth weekday out of range, should be 1-5 or L. Value: " + *nth);
+    fail("nth weekday '" + *nth + "' is out of range, expected 1-5 or L");
   }
 };
 
+}  // namespace detail
 }  // namespace croner
 
 #endif  // CRONER_PATTERN_HPP

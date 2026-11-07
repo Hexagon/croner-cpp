@@ -1,7 +1,8 @@
 # Review and roadmap
 
-Review of croner-cpp 0.1.0 (2026-11-07), and a plan for the work before 1.0. Release and
-packaging steps are in [PUBLISHING.md](PUBLISHING.md).
+Review of croner-cpp 0.1.0 (2026-11-07), and a plan for the work before 1.0. Phases 1 and 2 are
+done in 0.2.0, see [CHANGELOG.md](CHANGELOG.md). Release and packaging steps are in
+[PUBLISHING.md](PUBLISHING.md).
 
 ## Summary
 
@@ -106,21 +107,24 @@ now is the time to change it.
 
 ## Plan
 
-### Phase 1: small fixes, no API change (0.1.x)
+### Phase 1: small fixes (done in 0.2.0)
 
-- [ ] Error messages with C++ names and without JavaScript class prefixes (8).
-- [ ] Replace `std::recursive_mutex` and `std::condition_variable_any` with `std::mutex` and
-      `std::condition_variable` (12). TSan in CI covers the change.
-- [ ] `std::bitset` for pattern fields (15), and skip the `W` scan when unused (16).
-- [ ] `[[nodiscard]]` on queries (9).
-- [ ] Rewrite comments that refer to the JavaScript sources (17).
-- [ ] Decide on the lenient cases in (11): reject `FRI#` and `5#2#3`, and keep the rest in step
-      with the other implementations (raise it upstream where it is a shared bug).
-- [ ] `.clang-format`, `CHANGELOG.md`, `check_min_cppstd` in `conanfile.py` (19, 20).
+- [x] Error messages with C++ names and without JavaScript class prefixes (8).
+- [x] Replace `std::recursive_mutex` and `std::condition_variable_any` with `std::mutex` and
+      `std::condition_variable` (12).
+- [x] `std::bitset` for pattern fields (15), and skip the `W` scan when unused (16).
+- [x] `[[nodiscard]]` on queries (9).
+- [x] Rewrite comments that refer to the JavaScript sources (17).
+- [x] Reject `FRI#` and `5#2#3` (11). `L` anywhere in day of month is kept, in step with the
+      other implementations.
+- [x] Searches without a year field continue past the year 3000 (10).
+- [x] `.clang-format`, `CHANGELOG.md`, `check_min_cppstd` in `conanfile.py`, `error.hpp` and
+      `version.hpp` (18, 19, 20).
+- [ ] Raise the lenient `#` parsing upstream in croner.js.
 
-### Phase 2: API for 0.2 (breaking)
+### Phase 2: API for 0.2 (breaking, done in 0.2.0)
 
-Split evaluation from execution, keeping the parser and search as they are:
+Split evaluation from execution, keeping the parser and search as they are. As implemented:
 
 ```cpp
 // Immutable, copyable value. Thread-safe const queries, no threads, no global state.
@@ -130,7 +134,7 @@ croner::Cron cron("0 30 9 * * MON-FRI", opts);
 cron.next_run();                          // std::optional<TimePoint>
 cron.next_runs(5, from);
 cron.match(tp);
-for (auto run : cron.runs_from(tp)) { /* ... */ }
+for (auto run : cron.runs(tp)) { /* ... */ }
 
 // Runs a function on a schedule. Movable handle, stops and joins on destruction.
 croner::JobOptions job_opts;
@@ -138,22 +142,22 @@ job_opts.max_runs = 10;
 job_opts.protect = true;
 croner::Job job(cron, [] { /* ... */ }, job_opts);
 job.pause(); job.resume(); job.stop(); job.join();
-job.runs_left(); job.is_busy();
+job.runs_left(); job.is_busy(); job.next_run();
 ```
 
-- [ ] `Cron` becomes the value type (1). The time zone is a single `TimeZonePtr` field (3), and
+- [x] `Cron` becomes the value type (1). The time zone is a single `TimeZonePtr` field (3), and
       the options are split into evaluation options (`mode`, `dom_and_dow`,
       `alternative_weekdays`, `sloppy_ranges`, `day_offset`, `start_at`, `stop_at`,
       `interval`) and job options (`max_runs`, `paused`, `protect`, `on_protect`,
       `on_error`, `allow_past`).
-- [ ] `Job` owns the threads, holds its state in a shared block so the handle can be moved,
-      and accepts `void()` or `void(Job&)` job functions (6).
-- [ ] `std::chrono` durations for `interval` and `utc_offset` (4), and C++ names (5).
-- [ ] Remove the global named-job registry (2). Users who need lookup by name keep a map.
-- [ ] Move `CronDate` and `SearchOptions` to `detail`, make `CronPattern` read-only (7).
-- [ ] Error categories: either a `code()` on `CronError`, or subclasses for pattern, date and
-      time zone errors (8).
-- [ ] Keep the differential and OCPS drivers working; they only use the evaluation API.
+- [x] `Job` owns the threads, holds its state in a shared block so the handle can be moved
+      (and a job function can destroy its own job), and accepts `void()` or `void(Job&)` job
+      functions (6).
+- [x] `std::chrono` durations for `interval` and `utc_offset` (4), and C++ names (5).
+- [x] Remove the global named-job registry (2). Users who need lookup by name keep a map.
+- [x] Move `CronDate`, `SearchOptions` and `CronPattern` to `detail` (7).
+- [x] Error categories: `CronError::kind()` (8).
+- [x] Keep the differential and OCPS drivers working; they only use the evaluation API.
 
 ### Phase 3: scheduling (0.3)
 
