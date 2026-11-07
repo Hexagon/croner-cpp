@@ -11,7 +11,7 @@ class CronerConan(ConanFile):
     url = "https://github.com/Hexagon/croner-cpp"
     homepage = "https://croner.56k.guru"
     description = ("Cron expression parser and scheduler with time zone and DST support. "
-                   "Header-only C++17 port of Croner for JavaScript.")
+                   "Header-only, C++17, no dependencies.")
     topics = ("cron", "scheduler", "crontab", "timezone", "header-only")
     package_type = "header-library"
     settings = "os", "arch", "compiler", "build_type"

@@ -1,8 +1,7 @@
 // Croner for C++ - MIT License - Hexagon <github.com/Hexagon>
 //
-// Trigger functions and/or evaluate cron expressions. Header-only, C++17, no dependencies.
-// https://github.com/Hexagon/croner-cpp
-// A port of Croner for JavaScript (https://github.com/Hexagon/croner).
+// Parse and evaluate cron expressions, and run functions on a schedule.
+// Header-only, C++17, no dependencies. https://github.com/Hexagon/croner-cpp
 
 #ifndef CRONER_CRONER_HPP
 #define CRONER_CRONER_HPP

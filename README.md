@@ -2,21 +2,23 @@
 
 Croner is available for [JavaScript/TypeScript](https://github.com/Hexagon/croner) · [Rust](https://github.com/Hexagon/croner-rust) · [Python](https://github.com/Hexagon/croner-py) · [.NET](https://github.com/Hexagon/croner-dotnet) · **C++**
 
-Trigger functions and/or evaluate cron expressions in C++. Header-only, C++17, no dependencies.
+Parse and evaluate cron expressions, and run functions on a schedule. Header-only C++17, no
+dependencies beyond the standard library.
 
-A port of [Croner](https://github.com/Hexagon/croner) for JavaScript. It uses the same algorithms
-and gives the same results (apart from a few bugs fixed here, see below), which is checked by a
-differential test that runs random patterns, options, time zones and dates through croner.js,
-croner-rust and this port.
-
-- Follows the [Open Cron Pattern Standard](https://github.com/open-source-cron/ocps) (OCPS) 1.0
-  to 1.4: seconds and year fields, `L`, `W`, `LW`, `#`, `?`, `+` (AND), nicknames such as
-  `@daily`. DST handling follows Vixie cron and croner-rust (see "DST" below).
-- IANA time zones with no dependencies. It reads the system zoneinfo database, or uses
-  C++20 `std::chrono::tzdb`.
-- Evaluates next and previous runs, matches dates, and iterates over runs.
-- Schedules job functions on background threads, with pause, resume, stop, `max_runs`,
-  `protect` (overrun protection), error handlers, `start_at`/`stop_at` and `interval`.
+- **Full cron syntax**, following the [Open Cron Pattern Standard](https://github.com/open-source-cron/ocps)
+  (OCPS) 1.0 to 1.4: optional seconds and year fields, `L`, `W`, `LW`, `#`, `?`, `+` (AND of
+  day-of-month and day-of-week), names (`MON`, `JAN`) and nicknames (`@daily`).
+- **Time zones without dependencies.** Reads the system zoneinfo database on Linux, macOS and
+  the BSDs, or uses C++20 `std::chrono::tzdb`. Fixed UTC offsets and custom time zone
+  implementations are supported too.
+- **Defined DST behaviour.** Fixed-time jobs run once when the clock goes back and still run
+  when the clock skips their time; interval jobs follow the real clock (see [DST](#dst)).
+- **Evaluation:** next and previous runs, matching, and iteration with range-for.
+- **Scheduling:** background threads, pause and resume, `max_runs`, overrun protection, error
+  handlers, `start_at` / `stop_at` and minimum intervals.
+- **Tested** with unit tests, the OCPS conformance test vectors, a zoneinfo reader checked against
+  the C library for every zone, sanitizers, and differential testing against the other Croner
+  implementations.
 
 ```cpp
 #include <croner/croner.hpp>
@@ -40,7 +42,7 @@ int main() {
 
 ## Installation
 
-The library is the five headers in `include/croner`. Any of these work:
+The library is the headers in `include/croner`. Requires a C++17 compiler and threads. Any of these work:
 
 **CMake FetchContent**
 
@@ -68,6 +70,41 @@ target_link_libraries(my_app PRIVATE croner::croner)
 
 **Copy the headers** to your include path, and link threads (`-pthread`).
 
+## Pattern syntax
+
+```
+┌──────────────── second (optional)       0-59
+│ ┌────────────── minute                  0-59
+│ │ ┌──────────── hour                    0-23
+│ │ │ ┌────────── day of month            1-31, L, W, LW
+│ │ │ │ ┌──────── month                   1-12 or JAN-DEC
+│ │ │ │ │ ┌────── day of week             0-7 or SUN-SAT (0 and 7 are Sunday), #, L, +
+│ │ │ │ │ │ ┌──── year (optional)         1-9999
+│ │ │ │ │ │ │
+* * * * * * *
+```
+
+Five fields are minute to day of week, six add seconds first, seven add the year last.
+
+| Syntax      | Meaning                                                        | Example                        |
+| ----------- | -------------------------------------------------------------- | ------------------------------ |
+| `*` or `?`  | Any value                                                      | `* * * * *` every minute       |
+| `a,b`       | List                                                           | `0 9,17 * * *`                 |
+| `a-b`       | Range                                                          | `0 9 * * MON-FRI`              |
+| `*/n`       | Every n-th value                                               | `*/15 * * * *`                 |
+| `a-b/n`     | Every n-th value in a range                                    | `0 8-18/2 * * *`               |
+| `L`         | Last day of the month (day of month)                           | `0 0 L * *`                    |
+| `nW`        | Weekday (Mon-Fri) nearest to day n, within the month           | `0 0 15W * *`                  |
+| `LW`        | Last weekday of the month                                      | `0 0 LW * *`                   |
+| `day#n`     | n-th occurrence of a weekday in the month                      | `0 0 * * FRI#2`                |
+| `dayL`      | Last occurrence of a weekday in the month                      | `0 0 * * 5L`                   |
+| `+`         | Day of month **and** day of week must both match               | `0 0 1-7 * +MON`               |
+
+When both day of month and day of week are restricted, a day matches if **either** does, as in
+Vixie cron. Use `+` in the day-of-week field, or the `dom_and_dow` option, to require both.
+
+Nicknames: `@yearly` / `@annually`, `@monthly`, `@weekly`, `@daily` / `@midnight`, `@hourly`.
+
 ## Evaluating patterns
 
 ```cpp
@@ -88,8 +125,8 @@ for (auto run : job.enumerate()) {              // infinite for most patterns, s
 `croner::TimePoint` is a `std::chrono::system_clock` time point with millisecond precision.
 Reference dates (`croner::DateRef`) can be any `system_clock` time point, or an ISO 8601
 string: `"2025-01-01"`, `"2025-01-01T12:00:00"`, `"2025-01-01T12:00:00.500Z"`,
-`"2025-01-01T12:00:00+02:00"`. A string without `Z` or an offset is a wall clock time in the time
-zone of the job.
+`"2025-01-01T12:00:00+02:00"`. A string without `Z` or an offset, including a date-only string,
+is a wall clock time in the time zone of the job.
 
 A string containing a `:` (or a time point) creates a one-off job instead of a pattern:
 
@@ -121,10 +158,9 @@ job.stop();         // permanent; a running job function finishes
 job.join();         // wait until there are no more runs
 ```
 
-Without `catch_errors` or `on_error`, an exception thrown by a job function on the scheduler's
-worker thread calls `std::terminate`, like an unhandled exception in any `std::thread` (and like
-an unhandled promise rejection crashes Node.js). `trigger()` lets exceptions propagate to the
-caller.
+Without `catch_errors` or `on_error`, an exception thrown by a job function on a worker thread
+calls `std::terminate`, like an unhandled exception in any `std::thread`. `trigger()` lets
+exceptions propagate to the caller.
 
 A `Cron` can't be copied or moved, as running job functions refer to it. Use
 `std::unique_ptr<croner::Cron>` to store jobs in containers. Don't destroy a job from inside its
@@ -132,40 +168,37 @@ own job function; call `self.stop()` instead.
 
 ## Options
 
-| JavaScript            | C++                                   | Notes                                              |
-| --------------------- | ------------------------------------- | -------------------------------------------------- |
-| `name`                | `name`                                | Named jobs are listed by `croner::scheduled_jobs()` |
-| `paused`              | `paused`                              |                                                    |
-| `maxRuns`             | `max_runs`                            | `std::optional`, unlimited if not set               |
-| `catch`               | `catch_errors`, `on_error`            |                                                    |
-| `interval`            | `interval`                            | seconds                                            |
-| `protect`             | `protect`, `on_protect`               |                                                    |
-| `startAt`, `stopAt`   | `start_at`, `stop_at`                 | `croner::DateRef`                                   |
-| `timezone`            | `timezone`                            | IANA name, default is the system local time zone   |
-| `utcOffset`           | `utc_offset`                          | minutes                                            |
-|                       | `zone`                                | your own `croner::TimeZone` implementation         |
-| `domAndDow`           | `dom_and_dow`                         |                                                    |
-| `dayOffset`           | `day_offset`                          |                                                    |
-| `mode`                | `mode`                                | `croner::Mode::Auto`, `FivePart`, ...               |
-| `alternativeWeekdays` | `alternative_weekdays`                |                                                    |
-| `sloppyRanges`        | `sloppy_ranges`                       |                                                    |
-| `allowPast`           | `allow_past`                          |                                                    |
-| `context`             |                                       | capture state in the lambda instead                |
-| `unref`               |                                       | see `join()` and `stop()`                           |
-| `legacyMode`          |                                       | deprecated in JavaScript, use `dom_and_dow`         |
+All fields of `croner::Options` are optional.
 
-Methods are named in snake_case: `nextRun()` is `next_run()`, `previousRuns()` is
-`previous_runs()` and so on. Invalid patterns, options, dates and time zones throw
-`croner::CronError`.
+| Option                 | Type                       | Default       | Description                                                                   |
+| ---------------------- | -------------------------- | ------------- | ----------------------------------------------------------------------------- |
+| `timezone`             | `std::string`              | local time    | IANA time zone, e.g. `"America/New_York"`                                     |
+| `utc_offset`           | `std::optional<int>`       |               | Fixed UTC offset in minutes, instead of `timezone`                            |
+| `zone`                 | `croner::TimeZonePtr`      |               | Your own time zone implementation, instead of `timezone`                      |
+| `mode`                 | `croner::Mode`             | `Auto`        | Accepted pattern lengths: `Auto`, `FivePart`, `SixPart`, `SevenPart`, ...     |
+| `dom_and_dow`          | `bool`                     | `false`       | Require both day of month and day of week to match                            |
+| `alternative_weekdays` | `bool`                     | `false`       | Quartz weekday numbering, 1 = Sunday ... 7 = Saturday                         |
+| `sloppy_ranges`        | `bool`                     | `false`       | Accept non-standard steps like `/10` and `5/5`                                |
+| `day_offset`           | `int`                      | `0`           | Shift every run by a number of days                                           |
+| `start_at`             | `std::optional<DateRef>`   |               | First allowed run, inclusive                                                  |
+| `stop_at`              | `std::optional<DateRef>`   |               | Last allowed run, exclusive                                                   |
+| `interval`             | `std::int64_t`             | `0`           | Minimum number of seconds between runs                                        |
+| `max_runs`             | `std::optional<int64_t>`   | unlimited     | Number of scheduled runs before the job stops                                 |
+| `paused`               | `bool`                     | `false`       | Create the job paused                                                         |
+| `protect`              | `bool`                     | `false`       | Skip a run while the previous one is still running                            |
+| `on_protect`           | `std::function`            |               | Called when a run is skipped by `protect` (implies `protect`)                 |
+| `catch_errors`         | `bool`                     | `false`       | Catch exceptions thrown by the job function                                   |
+| `on_error`             | `std::function`            |               | Called with caught exceptions (implies `catch_errors`)                        |
+| `allow_past`           | `bool`                     | `false`       | Let a one-off job dated in the past run immediately                           |
+| `name`                 | `std::string`              |               | Unique name; named jobs are listed by `croner::scheduled_jobs()`              |
 
-The pattern syntax is the same as for Croner in JavaScript, see the
-[pattern documentation](https://croner.56k.guru/usage/pattern/).
+Invalid patterns, options, dates and time zones throw `croner::CronError`, which derives from
+`std::runtime_error`.
 
 ## Time zones
 
-Time zones are a `croner::TimeZone` that answers one question: what is the UTC offset at an
-instant? Local times, DST gaps and repeated hours are derived from that, as in the JavaScript
-version.
+A time zone is a `croner::TimeZone`, which answers one question: what is the UTC offset at an
+instant? Local times, DST gaps and repeated hours are derived from that.
 
 - `opts.timezone = "America/New_York"` reads the system zoneinfo database (`/usr/share/zoneinfo`,
   or `$TZDIR`) on Linux, macOS and the BSDs, including the POSIX TZ rule that continues each zone
@@ -178,58 +211,48 @@ version.
 - `opts.zone` takes your own implementation, for example on embedded systems without a zoneinfo
   database.
 
-`"UTC"` and `"Etc/UTC"` work even without a time zone database.
+`"UTC"` and `"Etc/UTC"` work even without a time zone database. Zone names are case-sensitive,
+as in the zoneinfo database.
 
 ### DST
-
-As in Croner for JavaScript and croner-rust, which deviate from OCPS 1.4 §4.3.1:
 
 - Fixed-time jobs (a single second, minute and hour) run once in a repeated hour, on the first
   pass, and run when a DST gap ends if their time is in the gap.
 - Interval jobs (wildcard, step, range or list in second, minute or hour) run on both passes of a
   repeated hour, and skip times in a DST gap.
 
+This follows Vixie cron, and deliberately deviates from OCPS 1.4 §4.3.1. All Croner
+implementations behave this way.
+
 ## Year range
 
 The year field accepts 1-9999, wider than the OCPS standard range of 1970-2199. Steps from a
 wildcard are counted from year 0, so `*/2` matches even years, the same years as in the standard
-range (OCPS 1.4 section 4.3.2). Explicit ranges step from their start: `1971-2199/2` is odd years.
-Searches without a year field look at most 400 years ahead or back.
+range (OCPS 1.4 §4.3.2). Explicit ranges step from their start: `1971-2199/2` is odd years.
+Searches without a year field look at most 400 years ahead or back, and not past the year 3000.
 
 ## Standards and compatibility
 
 Checked in CI:
 
 - [OCPS](https://github.com/open-source-cron/ocps) conformance test vectors
-  (`tests/ocps/ocps.ts`): all pass, except three deliberate deviations shared with croner.js and
-  croner-rust: nicknames are case-insensitive (`@Daily`), `@reboot` is rejected when the pattern
-  is parsed (there is no startup event to run on), and `?` is accepted in every field as an alias
-  for `*`.
-- Results are compared with croner.js and croner-rust for random patterns, options, time zones
-  and dates (`tests/differential`). Expected differences with croner-rust are parsing
-  strictness (croner-rust rejects some patterns croner.js accepts, like `*,5`), tz data versions,
-  and two croner-rust issues: `*/2` in the year field matches odd years, and searches can stop
-  early around the day Samoa skipped in 2011.
+  (`tests/ocps/ocps.ts`): all pass, except three deliberate deviations shared with the other
+  Croner implementations: nicknames are case-insensitive (`@Daily`), `@reboot` is rejected when
+  the pattern is parsed (there is no startup event to run on), and `?` is accepted in every
+  field as an alias for `*`.
+- Differential testing (`tests/differential`): random patterns, options, time zones and dates
+  are evaluated by this library, croner.js and croner-rust, and the results compared.
 
-## Differences from Croner for JavaScript
+Known differences from the other implementations, all deliberate:
 
-Fixed here, but present in croner.js 11.0.0:
-
-- Days that don't exist in a month don't skip the first days of the next month. croner.js tries
-  e.g. February 31, rolls over to March 3, and so `0 0 1,31 * *` searched from February 2 skips
-  March 1.
-- `@weekly` works with `alternative_weekdays` (croner.js rejects it, as it expands to `0`).
-- Years 1-99 in the year field work. In JavaScript, `Date.UTC()` reads them as 1900-1999, so they
-  never match.
-
-Other differences:
-
-- A date-only string, `"2025-01-01"`, is midnight in the job's time zone. JavaScript reads it as
-  UTC midnight.
-- Time zone names are looked up in the zoneinfo database, where they are case-sensitive
-  (`Intl` in JavaScript accepts any case).
-- Before 1900, results can differ where the time zone databases differ (Node.js ships ICU's
-  tzdata, with historic local mean times that some systems don't have).
+- Days that don't exist in a month never skip the first days of the next month (croner.js 11.0.0
+  rolls e.g. February 31 over to March 3, so `0 0 1,31 * *` searched from February 2 skips
+  March 1).
+- `@weekly` works with `alternative_weekdays`, and years 1-99 work in the year field.
+- croner-rust rejects some patterns that are accepted here, like `*,5`, and has two open issues
+  that are fixed here: `*/2` in the year field matches odd years, and searches can stop early
+  around the day Samoa skipped in 2011.
+- Before 1900, results can differ where the time zone databases differ.
 
 ## Tests
 

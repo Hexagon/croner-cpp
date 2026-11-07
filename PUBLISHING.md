@@ -43,6 +43,8 @@ scheduler with overrun protection.
 
 ## Checklist before 1.0 and the package manager submissions
 
+See also [ROADMAP.md](ROADMAP.md) for the review findings and the planned API changes.
+
 - [x] CI green on Linux (GCC, Clang), macOS and Windows (MSVC C++20, `std::chrono::tzdb`).
 - [x] OCPS conformance test vectors, and differential tests against croner.js and croner-rust.
 - [ ] Fix the bugs found in croner.js (day rollover, `@weekly` with alternative weekdays, years
