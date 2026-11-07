@@ -1,18 +1,20 @@
 // Differential test: random patterns, options, time zones and reference dates are evaluated by
 // the JavaScript implementation and by the C++ port (driver.cpp), and the results compared.
 //
-// Usage (from the croner repository root, after `npm install`):
-//   g++ -std=c++17 -O2 -Icpp/include cpp/tests/differential/driver.cpp -o /tmp/croner-driver
-//   npx tsx cpp/tests/differential/fuzz.ts /tmp/croner-driver [cases] [seed]
+// Usage (from this directory, after building the driver with CMake):
+//   npm install
+//   npx tsx fuzz.ts ../../build/croner_differential_driver [cases] [seed]
 //
-// Set CRONER_JS to the path of croner.ts (or an npm build) to test against another version.
+// Compares with the croner version in package.json. Set CRONER_JS to the path of a croner.ts or
+// croner.js file (e.g. a checkout of hexagon/croner) to test against another version.
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import * as path from "node:path";
 
-const jsPath = process.env.CRONER_JS ??
-  path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../../src/croner.ts");
-const { Cron } = await import(pathToFileURL(jsPath).href);
+const jsPath = process.env.CRONER_JS;
+const { Cron } = jsPath
+  ? await import(pathToFileURL(path.resolve(jsPath)).href)
+  : await import("croner");
 
 const driver = process.argv[2];
 const cases = Number(process.argv[3] ?? 5000);

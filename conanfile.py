@@ -8,7 +8,7 @@ class CronerConan(ConanFile):
     name = "croner"
     version = "0.1.0"
     license = "MIT"
-    url = "https://github.com/Hexagon/croner"
+    url = "https://github.com/Hexagon/croner-cpp"
     homepage = "https://croner.56k.guru"
     description = ("Cron expression parser and scheduler with time zone and DST support. "
                    "Header-only C++17 port of Croner for JavaScript.")

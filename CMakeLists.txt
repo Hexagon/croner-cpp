@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.14)
 
 project(croner VERSION 0.1.0 LANGUAGES CXX
         DESCRIPTION "Cron expression parser and scheduler, a port of Croner for JavaScript"
-        HOMEPAGE_URL "https://github.com/Hexagon/croner")
+        HOMEPAGE_URL "https://github.com/Hexagon/croner-cpp")
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)

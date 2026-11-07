@@ -44,9 +44,8 @@ The library is the five headers in `include/croner`. Any of these work:
 ```cmake
 include(FetchContent)
 FetchContent_Declare(croner
-  GIT_REPOSITORY https://github.com/Hexagon/croner.git
-  GIT_TAG        <tag or commit>
-  SOURCE_SUBDIR  cpp)
+  GIT_REPOSITORY https://github.com/Hexagon/croner-cpp.git
+  GIT_TAG        <tag or commit>)
 FetchContent_MakeAvailable(croner)
 target_link_libraries(my_app PRIVATE croner::croner)
 ```
@@ -54,7 +53,7 @@ target_link_libraries(my_app PRIVATE croner::croner)
 **Installed package**
 
 ```sh
-cmake -S cpp -B build && cmake --install build --prefix /usr/local
+cmake -S . -B build && cmake --install build --prefix /usr/local
 ```
 
 ```cmake
@@ -62,7 +61,7 @@ find_package(croner 0.1 REQUIRED)
 target_link_libraries(my_app PRIVATE croner::croner)
 ```
 
-**Conan** (local recipe, `conan create cpp`), then `requires = "croner/0.1.0"`.
+**Conan** (local recipe, `conan create .`), then `requires = "croner/0.1.0"`.
 
 **Copy the headers** to your include path, and link threads (`-pthread`).
 
@@ -201,15 +200,16 @@ As in Croner for JavaScript and croner-rust, which deviate from OCPS 1.4 §4.3.1
 ## Tests
 
 ```sh
-cmake -S cpp -B build && cmake --build build && ctest --test-dir build
+cmake -S . -B build && cmake --build build && ctest --test-dir build
 ```
 
 - `tests/croner_test.cpp`, unit tests, including scheduling.
-- `tests/differential`, compares results with croner.js for random patterns, options, time zones
-  and dates (run from the repository root after `npm install`):
+- `tests/differential`, compares results with croner.js (from npm) for random patterns,
+  options, time zones and dates:
 
   ```sh
-  npx tsx cpp/tests/differential/fuzz.ts build/croner_differential_driver 50000
+  cd tests/differential && npm install
+  npx tsx fuzz.ts ../../build/croner_differential_driver 50000
   ```
 
 - `tests/tz_compare.cpp`, compares the zoneinfo reader with the C library for every zone.
