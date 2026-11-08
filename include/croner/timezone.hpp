@@ -4,7 +4,7 @@
 //
 // Time zones are modelled by a single question: "what is the UTC offset at this instant?".
 // Everything else (converting local time to instants, DST gaps and overlaps) is derived from
-// that, exactly like the JavaScript version derives it from Intl.DateTimeFormat.
+// that, so a custom zone only has to implement utc_offset().
 //
 // Backends:
 //  - Fixed offsets (UTC, utc_offset option)
@@ -26,15 +26,17 @@
 #include <cstdlib>
 #include <ctime>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include "error.hpp"
 
 #ifndef CRONER_USE_STD_CHRONO_TZDB
 #if defined(_WIN32) && (defined(_MSVC_LANG) && _MSVC_LANG >= 202002L)
@@ -46,16 +48,10 @@
 
 namespace croner {
 
-/// Milliseconds since the Unix epoch (UTC).
-using Millis = std::int64_t;
-
-/// Error thrown for invalid patterns, options, dates or time zones.
-class CronError : public std::runtime_error {
- public:
-  using std::runtime_error::runtime_error;
-};
-
 namespace detail {
+
+/// Milliseconds since the Unix epoch (UTC)
+using Millis = std::int64_t;
 
 constexpr Millis MS_PER_SECOND = 1000;
 constexpr Millis MS_PER_DAY = 86400000;
@@ -110,7 +106,7 @@ constexpr int days_in_month(std::int64_t y, int m) {
 }
 
 /// Broken down time. Month is 1-12. Values may be out of range when passed to to_millis(),
-/// they overflow into the next unit like Date.UTC() does in JavaScript.
+/// they then carry over into the next larger unit (minute 60 is the next hour, and so on).
 struct DateTime {
   std::int64_t year = 1970;
   std::int64_t month = 1;
@@ -159,13 +155,13 @@ class TimeZone {
   virtual ~TimeZone() = default;
 
   /// UTC offset in seconds (local time minus UTC) at an instant given in seconds since the epoch.
-  virtual std::int32_t utc_offset(std::int64_t unix_seconds) const = 0;
+  [[nodiscard]] virtual std::int32_t utc_offset(std::int64_t unix_seconds) const = 0;
 
   /// Name of the zone, e.g. "Europe/Stockholm", "UTC+01:00" or "local".
-  virtual std::string name() const = 0;
+  [[nodiscard]] virtual std::string name() const = 0;
 
   /// True if the offset never changes, which lets the scheduler skip DST handling.
-  virtual bool is_fixed() const { return false; }
+  [[nodiscard]] virtual bool is_fixed() const { return false; }
 };
 
 using TimeZonePtr = std::shared_ptr<const TimeZone>;
@@ -231,8 +227,7 @@ struct PosixRule {
         if (is_leap_year(year) && r.day >= 60) ++d;
         return d;
       }
-      case 'N':
-        return jan1 + r.day;
+      case 'N': return jan1 + r.day;
       default: {
         const std::int64_t first = days_from_civil(year, r.month, 1);
         const int wd = weekday_from_days(first);
@@ -381,7 +376,9 @@ class PosixParser {
 class TzifZone final : public TimeZone {
  public:
   TzifZone(std::string name, const std::string& data) : name_(std::move(name)) {
-    if (!parse(data)) throw CronError("Invalid time zone file for '" + name_ + "'");
+    if (!parse(data)) {
+      throw CronError(CronError::Kind::TimeZone, "invalid zoneinfo file for '" + name_ + "'");
+    }
   }
 
   std::int32_t utc_offset(std::int64_t t) const override {
@@ -437,8 +434,7 @@ class TzifZone final : public TimeZone {
   static bool block_size(const std::string& d, std::size_t pos, int ts, std::size_t& next) {
     std::int64_t c[6];  // isutcnt, isstdcnt, leapcnt, timecnt, typecnt, charcnt
     if (!counts(d, pos, c)) return false;
-    const std::int64_t size =
-        c[3] * ts + c[3] + c[4] * 6 + c[5] + c[2] * (ts + 4) + c[1] + c[0];
+    const std::int64_t size = c[3] * ts + c[3] + c[4] * 6 + c[5] + c[2] * (ts + 4) + c[1] + c[0];
     next = pos + 44 + static_cast<std::size_t>(size);
     return next <= d.size();
   }
@@ -501,9 +497,10 @@ inline bool valid_zone_name(std::string_view name) {
 
 inline std::vector<std::string> zoneinfo_dirs() {
   std::vector<std::string> dirs;
-  if (const char* env = std::getenv("TZDIR"); env != nullptr && *env != '\0') dirs.emplace_back(env);
-  for (const char* d : {"/usr/share/zoneinfo", "/usr/lib/zoneinfo", "/usr/share/lib/zoneinfo",
-                        "/etc/zoneinfo"})
+  if (const char* env = std::getenv("TZDIR"); env != nullptr && *env != '\0')
+    dirs.emplace_back(env);
+  for (const char* d :
+       {"/usr/share/zoneinfo", "/usr/lib/zoneinfo", "/usr/share/lib/zoneinfo", "/etc/zoneinfo"})
     dirs.emplace_back(d);
   return dirs;
 }
@@ -538,9 +535,15 @@ inline TimeZonePtr load_zone(const std::string& name) {
 
 }  // namespace detail
 
-/// A zone with a constant offset from UTC, in minutes.
-inline TimeZonePtr fixed_offset_zone(int offset_minutes) {
-  return std::make_shared<detail::FixedOffsetZone>(offset_minutes * 60);
+/// A zone with a constant offset from UTC (local time minus UTC), e.g. 330 minutes for India.
+/// @throws CronError if the offset is 24 hours or more.
+inline TimeZonePtr fixed_offset_zone(std::chrono::minutes offset) {
+  if (offset.count() <= -24 * 60 || offset.count() >= 24 * 60) {
+    throw CronError(CronError::Kind::TimeZone,
+                    "UTC offset of " + std::to_string(offset.count()) +
+                        " minutes is out of range, it must be less than 24 hours");
+  }
+  return std::make_shared<detail::FixedOffsetZone>(static_cast<std::int32_t>(offset.count() * 60));
 }
 
 /// UTC
@@ -557,23 +560,23 @@ inline TimeZonePtr local_zone() {
 
 /// Look up an IANA time zone such as "Europe/Stockholm". Results are cached.
 /// @throws CronError if the zone is unknown.
-inline TimeZonePtr locate_zone(const std::string& name) {
+inline TimeZonePtr locate_zone(std::string_view name) {
   static std::mutex mtx;
-  static std::map<std::string, TimeZonePtr> cache;
+  static std::map<std::string, TimeZonePtr, std::less<>> cache;
   std::lock_guard<std::mutex> lock(mtx);
   if (auto it = cache.find(name); it != cache.end()) return it->second;
-  TimeZonePtr z = detail::load_zone(name);
+  TimeZonePtr z = detail::load_zone(std::string(name));
   if (!z) {
-    throw CronError("Invalid timezone '" + name +
-                    "'. Please provide a valid IANA timezone (e.g., 'America/New_York', "
-                    "'Europe/Stockholm').");
+    throw CronError(CronError::Kind::TimeZone,
+                    "unknown time zone '" + std::string(name) +
+                        "', expected an IANA name such as 'Europe/Stockholm'");
   }
-  cache.emplace(name, z);
+  cache.emplace(std::string(name), z);
   return z;
 }
 
 // ---------------------------------------------------------------------------------------------
-// Local time resolution, a port of src/helpers/timezone.ts
+// Local time resolution: wall clock times to instants, and DST gaps and overlaps
 // ---------------------------------------------------------------------------------------------
 
 namespace detail {
@@ -671,7 +674,7 @@ struct IsoDateTime {
 /// A space may be used instead of "T".
 inline IsoDateTime parse_iso(std::string_view s) {
   const auto fail = [&]() -> CronError {
-    return CronError("CronDate: Invalid ISO8601 date string '" + std::string(s) + "'");
+    return CronError(CronError::Kind::Date, "invalid ISO 8601 date '" + std::string(s) + "'");
   };
   std::size_t i = 0;
   const auto digits = [&](std::size_t n, std::int64_t& out) {

@@ -1,5 +1,5 @@
 // Differential test: random patterns, options, time zones and reference dates are evaluated by
-// the JavaScript implementation and by the C++ port (driver.cpp), and the results compared.
+// the JavaScript implementation and by this library (driver.cpp), and the results compared.
 //
 // Usage (from this directory, after building the driver with CMake):
 //   npm install
@@ -165,7 +165,7 @@ function makeJob(c: Case): any {
   return new Cron(pat, o);
 }
 
-// Bugs in croner.js 11.0.0 that the C++ port fixes:
+// Bugs in croner.js 11.0.0 that are fixed here:
 // - The day search rolls over past the end of the month (February 31 becomes March 3), and skips
 //   the first days of the next month: "0 0 1,31 * *" from February 2 skips March 1. Recognized
 //   when the first differing C++ run is earlier than croner.js's, and croner.js's own match()
@@ -226,13 +226,17 @@ if (res.status !== 0) {
 }
 const cpp = res.stdout.toString().trimEnd().split("\n");
 // Known divergence: JavaScript's Date.UTC() reads years 0-99 as 1900-1999, so croner.js finds no
-// runs in years 1-99 (allowed in the year field by OCPS). The C++ port handles them.
+// runs in years 1-99 (allowed in the year field by OCPS). Croner for C++ handles them.
 const earlyYears = (runs: string) =>
   runs !== "-" && runs !== "ERR" && runs.split(",").every((r) => /^00\d\d-/.test(r));
 // Known divergence: before 1900 the time zone databases differ (Node.js ships ICU's tzdata with
 // historic local mean times, while many systems link zones like Europe/Stockholm to another zone)
 const before1900 = (runs: string) =>
   runs !== "-" && runs !== "ERR" && runs.split(",").every((r) => /^(0\d\d\d|1[0-8]\d\d)-/.test(r));
+// Known divergence: the C++ parser rejects a "#" without a number after it ("FRI#") or more than
+// one "#" ("SAT#2#3"), which croner.js reads as "FRI" and "SAT#2".
+const loosenth = (c: Case, cpp: string) =>
+  cpp === "ERR" && /#(,|\s|$)|#[^,\s]*#/.test(c[0]);
 let failures = 0, errors = 0, empty = 0, known = 0, fixed = 0;
 for (let i = 0; i < list.length; i++) {
   const js = runJs(list[i]);
@@ -240,7 +244,8 @@ for (let i = 0; i < list.length; i++) {
   if (js === "-") empty++;
   if (
     js !== cpp[i] &&
-    ((js === "-" && earlyYears(cpp[i])) || (before1900(js) && before1900(cpp[i])))
+    ((js === "-" && earlyYears(cpp[i])) || (before1900(js) && before1900(cpp[i])) ||
+      loosenth(list[i], cpp[i]))
   ) {
     known++;
   } else if (js !== cpp[i] && jsBugFixedInCpp(list[i], js, cpp[i])) {
@@ -254,7 +259,7 @@ for (let i = 0; i < list.length; i++) {
 }
 console.log(
   `${list.length} cases, ${failures} mismatches (${errors} invalid, ${empty} without runs, ` +
-    `${known} known divergences in years before 1900, ${fixed} croner.js bugs fixed in C++)`,
+    `${known} known divergences, ${fixed} croner.js bugs fixed here)`,
 );
 
 // Optionally also compare with croner-rust (rust/ in this directory), for the cases it supports:
@@ -277,12 +282,12 @@ if (rustDriver) {
     process.exit(2);
   }
   const rust = rres.stdout.toString().trimEnd().split("\n");
-  // Expected differences between croner-rust and the C++ port (which follows croner.js):
+  // Expected differences between croner-rust and Croner for C++ (which follows croner.js):
   // - croner-rust's parser is stricter: it rejects e.g. "*" inside lists ("*,5"), "2*" and "45?",
   //   which croner.js accepts. It accepts a few that croner.js rejects (an empty list item,
   //   steps larger than the field, "@weekly" with Quartz weekdays in croner.js 11.0.0).
   // - Africa/Casablanca: chrono-tz bundles an older tzdata than the system database.
-  // - Year steps: croner-rust starts "*/n" at year 1, croner.js and the C++ port at year 0, so
+  // - Year steps: croner-rust starts "*/n" at year 1, croner.js and Croner for C++ at year 0, so
   //   "*/2" is even years as OCPS 1.4 section 4.3.2 requires.
   // - croner-rust stops early in some cases, e.g. searching backwards over the day Samoa skipped
   //   (Pacific/Apia, 2011-12-30). Its runs are then a prefix of the C++ runs.

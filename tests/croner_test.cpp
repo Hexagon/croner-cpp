@@ -1,10 +1,11 @@
-// Unit tests for the C++ port. Expected values come from the JavaScript test suite
-// (../../test) and from running the JavaScript implementation.
+// Unit tests. Many expected values are shared with the test suites of the other Croner
+// implementations.
 #include <croner/croner.hpp>
 
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <memory>
 #include <stdexcept>
 #include <thread>
 
@@ -12,8 +13,11 @@
 
 using croner::Cron;
 using croner::CronError;
+using croner::CronOptions;
 using croner::DateRef;
-using croner::Options;
+using croner::Job;
+using croner::JobOptions;
+using namespace std::chrono_literals;
 
 namespace {
 
@@ -27,9 +31,9 @@ std::string iso(const std::optional<croner::TimePoint>& run) {
   return run ? croner::to_iso_string(*run) : "null";
 }
 
-Options tz(const std::string& zone) {
-  Options o;
-  o.timezone = zone;
+CronOptions tz(const std::string& zone) {
+  CronOptions o;
+  o.zone = croner::locate_zone(zone);
   return o;
 }
 
@@ -54,8 +58,8 @@ TEST("six part pattern with seconds") {
 }
 
 TEST("nicknames") {
-  CHECK_EQ(*Cron("@daily").get_pattern(), std::string("0 0 * * *"));
-  CHECK_EQ(*Cron("@HOURLY").get_pattern(), std::string("0 * * * *"));
+  CHECK_EQ(Cron("@daily").pattern(), std::string("0 0 * * *"));
+  CHECK_EQ(Cron("@HOURLY").pattern(), std::string("0 * * * *"));
   Cron job("@weekly", tz("Etc/UTC"));
   CHECK_EQ(iso(job.next_run("2024-01-01T00:00:00Z")), std::string("2024-01-07T00:00:00.000Z"));
   CHECK_THROWS(Cron("@reboot"));
@@ -100,7 +104,7 @@ TEST("day-of-month and day-of-week are ORed by default, ANDed with + or dom_and_
            (Strings{"2024-09-06T00:00:00.000Z", "2024-09-13T00:00:00.000Z"}));
   Cron and_job("0 0 13 * +FRI", tz("Etc/UTC"));
   CHECK_EQ(iso(and_job.next_run("2024-01-01T00:00:00Z")), std::string("2024-09-13T00:00:00.000Z"));
-  Options o = tz("Etc/UTC");
+  CronOptions o = tz("Etc/UTC");
   o.dom_and_dow = true;
   Cron and_option("0 0 13 * FRI", o);
   CHECK_EQ(iso(and_option.next_run("2024-01-01T00:00:00Z")),
@@ -128,7 +132,7 @@ TEST("year field") {
 }
 
 TEST("alternative weekdays (Quartz)") {
-  Options o = tz("Etc/UTC");
+  CronOptions o = tz("Etc/UTC");
   o.alternative_weekdays = true;
   Cron job("0 0 0 * * 2", o);  // 2 = Monday
   CHECK_EQ(iso(job.next_run("2024-01-01T00:00:00Z")), std::string("2024-01-08T00:00:00.000Z"));
@@ -146,7 +150,7 @@ TEST("days that don't exist in a month don't skip the start of the next month") 
 }
 
 TEST("@weekly with alternative weekdays is Sunday") {
-  Options o = tz("Etc/UTC");
+  CronOptions o = tz("Etc/UTC");
   o.alternative_weekdays = true;
   Cron job("@weekly", o);
   CHECK_EQ(iso(job.next_run("2025-10-01T00:00:00Z")), std::string("2025-10-05T00:00:00.000Z"));
@@ -183,16 +187,55 @@ TEST("invalid patterns throw") {
   CHECK_THROWS(Cron("* * * * +"));
   CHECK_THROWS(Cron("a * * * *"));
   CHECK_THROWS(Cron("0 0 0 1 1 * 0"));
-  Options sloppy;
+  CHECK_THROWS(Cron("* * * * FRI#"));
+  CHECK_THROWS(Cron("* * * * 5#2#3"));
+  CronOptions sloppy;
   sloppy.sloppy_ranges = true;
   Cron ok("0/10 * * * *", sloppy);
-  Options five;
+  CronOptions five;
   five.mode = croner::Mode::FivePart;
   CHECK_THROWS(Cron("* * * * * *", five));
 }
 
+TEST("errors tell what was invalid") {
+  try {
+    Cron("* * * * 9");
+    CHECK(false);
+  } catch (const CronError& e) {
+    CHECK(e.kind() == CronError::Kind::Pattern);
+    CHECK_EQ(std::string(e.what()),
+             std::string("invalid cron pattern '* * * * 9': day of week 9 is out of range"));
+  }
+  try {
+    (void)Cron("* * * * *", tz("Etc/UTC")).next_run("2025-13-01");
+    CHECK(false);
+  } catch (const CronError& e) {
+    CHECK(e.kind() == CronError::Kind::Date);
+  }
+  try {
+    (void)croner::locate_zone("Europe/Nowhere");
+    CHECK(false);
+  } catch (const CronError& e) {
+    CHECK(e.kind() == CronError::Kind::TimeZone);
+  }
+  try {
+    CronOptions o;
+    o.interval = -1s;
+    Cron("* * * * *", o);
+    CHECK(false);
+  } catch (const CronError& e) {
+    CHECK(e.kind() == CronError::Kind::Option);
+  }
+}
+
+TEST("searches without a year field reach past the year 3000") {
+  Cron job("0 0 1 1 *", tz("Etc/UTC"));
+  CHECK_EQ(iso(job.next_run("2999-06-01T00:00:00Z")), std::string("3000-01-01T00:00:00.000Z"));
+  CHECK(!job.next_run("9999-06-01T00:00:00Z"));
+}
+
 TEST("mode 5-part forces seconds to 0") {
-  Options o = tz("Etc/UTC");
+  CronOptions o = tz("Etc/UTC");
   o.mode = croner::Mode::FivePart;
   Cron job("* * * * *", o);
   CHECK_EQ(iso(job.next_run("2024-01-01T00:00:10Z")), std::string("2024-01-01T00:01:00.000Z"));
@@ -218,7 +261,7 @@ TEST("previous runs") {
 // --- Options --------------------------------------------------------------------------------
 
 TEST("start_at is inclusive, stop_at exclusive") {
-  Options o = tz("Etc/UTC");
+  CronOptions o = tz("Etc/UTC");
   o.start_at = DateRef("2024-01-01T00:02:00Z");
   o.stop_at = DateRef("2024-01-01T00:05:00Z");
   Cron job("* * * * *", o);
@@ -228,53 +271,41 @@ TEST("start_at is inclusive, stop_at exclusive") {
 }
 
 TEST("start_at strings are read in the time zone of the job") {
-  Options o = tz("Europe/Stockholm");
+  CronOptions o = tz("Europe/Stockholm");
   o.start_at = DateRef("2024-06-01T10:00:00");
   Cron job("0 * * * *", o);
   CHECK_EQ(iso(job.next_run("2024-01-01T00:00:00Z")), std::string("2024-06-01T08:00:00.000Z"));
 }
 
 TEST("interval") {
-  Options o = tz("Etc/UTC");
-  o.interval = 90;
+  CronOptions o = tz("Etc/UTC");
+  o.interval = 90s;
   Cron job("* * * * * *", o);
   CHECK_EQ(iso(job.next_runs(3, "2024-01-01T00:00:00Z")),
            (Strings{"2024-01-01T00:01:30.000Z", "2024-01-01T00:03:00.000Z",
                     "2024-01-01T00:04:30.000Z"}));
 }
 
-TEST("utc_offset") {
-  Options o;
-  o.utc_offset = 330;  // +05:30
+TEST("fixed UTC offset") {
+  CronOptions o;
+  o.zone = croner::fixed_offset_zone(330min);  // +05:30
   Cron job("0 0 9 * * *", o);
   CHECK_EQ(iso(job.next_run("2024-01-01T00:00:00Z")), std::string("2024-01-01T03:30:00.000Z"));
-  Options bad;
-  bad.utc_offset = 900;
-  CHECK_THROWS(Cron("* * * * *", bad));
-  Options both;
-  both.utc_offset = 60;
-  both.timezone = "Europe/Stockholm";
-  CHECK_THROWS(Cron("* * * * *", both));
+  CHECK_EQ(o.zone->name(), std::string("UTC+05:30"));
+  CHECK_THROWS(croner::fixed_offset_zone(24h));
+  CHECK_THROWS(croner::fixed_offset_zone(-24h));
 }
 
 TEST("day_offset shifts runs") {
-  Options o = tz("Etc/UTC");
+  CronOptions o = tz("Etc/UTC");
   o.day_offset = -1;
   Cron job("0 0 12 1 * *", o);  // the day before the 1st
   CHECK_EQ(iso(job.next_run("2024-01-15T00:00:00Z")), std::string("2024-01-31T12:00:00.000Z"));
 }
 
-TEST("max_runs limits next_runs") {
-  Options o = tz("Etc/UTC");
-  o.max_runs = 2;
-  Cron job("* * * * *", o);
-  CHECK_EQ(job.next_runs(5, "2024-01-01T00:00:00Z").size(), std::size_t(2));
-  CHECK_EQ(*job.runs_left(), std::int64_t(2));
-}
-
 TEST("invalid time zone throws") {
-  CHECK_THROWS(Cron("* * * * *", tz("Europe/Nowhere")));
-  CHECK_THROWS(Cron("* * * * *", tz("../../etc/passwd")));
+  CHECK_THROWS(croner::locate_zone("Europe/Nowhere"));
+  CHECK_THROWS(croner::locate_zone("../../etc/passwd"));
 }
 
 TEST("custom time zone implementation") {
@@ -282,49 +313,42 @@ TEST("custom time zone implementation") {
     std::int32_t utc_offset(std::int64_t) const override { return 7200; }
     std::string name() const override { return "plus2"; }
   };
-  Options o;
+  CronOptions o;
   o.zone = std::make_shared<Plus2>();
   Cron job("0 0 12 * * *", o);
   CHECK_EQ(iso(job.next_run("2024-01-01T00:00:00Z")), std::string("2024-01-01T10:00:00.000Z"));
 }
 
-TEST("named jobs are unique until stopped") {
-  Options o;
-  o.name = "unique-job";
-  {
-    Cron a("* * * * *", o);
-    CHECK_THROWS(Cron("* * * * *", o));
-    CHECK_EQ(croner::scheduled_jobs().size(), std::size_t(1));
-    a.stop();
-    CHECK(croner::scheduled_jobs().empty());
-    Cron b("* * * * *", o);
-  }
-  CHECK(croner::scheduled_jobs().empty());
+TEST("copies share the schedule") {
+  const Cron a("0 0 12 * * *", tz("Etc/UTC"));
+  const Cron b = a;
+  CHECK(&a.pattern() == &b.pattern());
+  CHECK_EQ(iso(b.next_run("2024-01-01T00:00:00Z")), std::string("2024-01-01T12:00:00.000Z"));
+  std::vector<Cron> crons(3, a);
+  CHECK_EQ(crons.size(), std::size_t(3));
 }
 
-// --- One-off jobs ----------------------------------------------------------------------------
+// --- Single runs ---------------------------------------------------------------------------
 
-TEST("one-off job from an ISO string") {
-  Cron job("2099-01-01T00:00:00Z");
-  CHECK(!job.get_pattern());
-  CHECK_EQ(iso(job.get_once()), std::string("2099-01-01T00:00:00.000Z"));
-  CHECK_EQ(iso(job.next_run()), std::string("2099-01-01T00:00:00.000Z"));
-  CHECK(job.match("2099-01-01T00:00:00Z"));
+TEST("single run from an ISO string") {
+  const Cron once = Cron::once("2099-01-01T00:00:00Z");
+  CHECK(once.pattern().empty());
+  CHECK_EQ(iso(once.once_at()), std::string("2099-01-01T00:00:00.000Z"));
+  CHECK_EQ(iso(once.next_run()), std::string("2099-01-01T00:00:00.000Z"));
+  CHECK(once.match("2099-01-01T00:00:00Z"));
+  CHECK(!once.next_run("2099-01-01T00:00:00Z"));
+  CHECK(!Cron("* * * * *").once_at());
+  // A date is not a pattern
+  CHECK_THROWS(Cron("2099-01-01T00:00:00Z"));
 }
 
-TEST("one-off job in the past has no run unless allow_past") {
-  Cron past("2000-01-01T00:00:00Z");
-  CHECK(!past.next_run());
-  Options o;
-  o.allow_past = true;
-  Cron allowed("2000-01-01T00:00:00Z", o);
-  CHECK(allowed.next_run().has_value());
+TEST("single run in the past has no next run") {
+  CHECK(!Cron::once("2000-01-01T00:00:00Z").next_run());
 }
 
-TEST("one-off job from a time point") {
+TEST("single run from a time point") {
   const auto at = croner::Clock::now() + std::chrono::hours(1);
-  Cron job(at);
-  CHECK(job.next_run().has_value());
+  CHECK(Cron::once(at).next_run().has_value());
 }
 
 // --- DST, shared with croner-rust -------------------------------------------------------------
@@ -362,29 +386,33 @@ TEST("iterating minutes through an overlap covers every instant once") {
     }
     auto backward = job.previous_runs(199, DateRef(forward[199]));
     std::reverse(backward.begin(), backward.end());
-    CHECK_EQ(iso(backward), iso(std::vector<croner::TimePoint>(forward.begin(), forward.begin() + 199)));
+    CHECK_EQ(iso(backward),
+             iso(std::vector<croner::TimePoint>(forward.begin(), forward.begin() + 199)));
   }
 }
 
 // --- Iterator ------------------------------------------------------------------------------
 
-TEST("enumerate with range-for") {
-  Options o = tz("Etc/UTC");
+TEST("runs with range-for") {
+  CronOptions o = tz("Etc/UTC");
   o.stop_at = DateRef("2024-01-01T00:03:00Z");
   Cron job("* * * * *", o);
   Strings runs;
-  for (auto t : job.enumerate("2024-01-01T00:00:00Z")) runs.push_back(croner::to_iso_string(t));
+  for (auto t : job.runs("2024-01-01T00:00:00Z")) runs.push_back(croner::to_iso_string(t));
   CHECK_EQ(runs, (Strings{"2024-01-01T00:01:00.000Z", "2024-01-01T00:02:00.000Z"}));
 }
 
-TEST("iterator peek, next and reset") {
-  Cron job("0 0 * * *", tz("Etc/UTC"));
-  auto it = job.enumerate("2024-01-01T00:00:00Z");
+TEST("run range peek and next, and outliving the schedule") {
+  auto it = Cron("0 0 * * *", tz("Etc/UTC")).runs("2024-01-01T00:00:00Z");
   CHECK_EQ(iso(it.peek()), std::string("2024-01-02T00:00:00.000Z"));
   CHECK_EQ(iso(it.next()), std::string("2024-01-02T00:00:00.000Z"));
   CHECK_EQ(iso(it.next()), std::string("2024-01-03T00:00:00.000Z"));
-  it.reset("2024-06-01T00:00:00Z");
-  CHECK_EQ(iso(it.next()), std::string("2024-06-02T00:00:00.000Z"));
+}
+
+TEST("previous_run and time_to_next") {
+  Cron job("0 0 12 * * *", tz("Etc/UTC"));
+  CHECK_EQ(iso(job.previous_run("2024-01-10T13:00:00Z")), std::string("2024-01-10T12:00:00.000Z"));
+  CHECK_EQ(job.time_to_next("2024-01-10T11:00:00Z")->count(), std::int64_t(3600000));
 }
 
 // --- Time zones -----------------------------------------------------------------------------
@@ -410,24 +438,26 @@ TEST("zoneinfo zones follow the POSIX footer far into the future") {
   CHECK_EQ(z->utc_offset(4102488000), 3600);  // 2100-01-01
 }
 
-// --- Scheduling ----------------------------------------------------------------------------
+// --- Jobs ----------------------------------------------------------------------------------
 
-TEST("scheduled job runs max_runs times, then stops") {
+TEST("job runs max_runs times, then stops") {
   std::atomic<int> runs{0};
-  Options o;
+  JobOptions o;
   o.max_runs = 2;
-  Cron job("* * * * * *", o, [&](Cron&) { ++runs; });
+  Job job(Cron("* * * * * *"), [&] { ++runs; }, o);
   CHECK(job.is_running());
+  CHECK(job.next_run().has_value());
   job.join();
   CHECK_EQ(runs.load(), 2);
   CHECK_EQ(*job.runs_left(), std::int64_t(0));
   CHECK(!job.is_running());
+  CHECK(!job.next_run());
   CHECK(job.previous_run().has_value());
 }
 
 TEST("job can stop itself") {
   std::atomic<int> runs{0};
-  Cron job("* * * * * *", [&](Cron& self) {
+  Job job(Cron("* * * * * *"), [&](Job& self) {
     ++runs;
     self.stop();
   });
@@ -436,28 +466,62 @@ TEST("job can stop itself") {
   CHECK(job.is_stopped());
 }
 
+TEST("job can be moved, and kept in a container") {
+  std::atomic<int> runs{0};
+  std::vector<Job> jobs;
+  JobOptions o;
+  o.max_runs = 1;
+  Job job(Cron("* * * * * *"), [&] { ++runs; }, o);
+  jobs.push_back(std::move(job));
+  jobs.emplace_back(Cron("* * * * * *"), [&] { ++runs; }, o);
+  for (auto& j : jobs) j.join();
+  CHECK_EQ(runs.load(), 2);
+}
+
+TEST("job can be destroyed from its own function") {
+  std::atomic<bool> done{false};
+  std::unique_ptr<Job> job;
+  JobOptions o;
+  o.paused = true;  // resumed once `job` is assigned, so the job function sees it
+  job = std::make_unique<Job>(
+      Cron("* * * * * *"),
+      [&] {
+        job.reset();
+        done = true;
+      },
+      o);
+  job->resume();
+  for (int i = 0; i < 40 && !done; ++i) std::this_thread::sleep_for(100ms);
+  CHECK(done.load());
+  CHECK(!job);
+}
+
 TEST("paused job does not run until resumed") {
   std::atomic<int> runs{0};
-  Options o;
+  JobOptions o;
   o.paused = true;
   o.max_runs = 1;
-  Cron job("* * * * * *", o, [&](Cron&) { ++runs; });
-  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+  Job job(Cron("* * * * * *"), [&] { ++runs; }, o);
+  CHECK(job.is_paused());
+  std::this_thread::sleep_for(1500ms);
   CHECK_EQ(runs.load(), 0);
-  CHECK(job.resume());
+  job.resume();
   job.join();
   CHECK_EQ(runs.load(), 1);
 }
 
 TEST("protect skips runs while busy and calls on_protect") {
   std::atomic<int> runs{0}, blocked{0};
-  Options o;
-  o.on_protect = [&](Cron&) { ++blocked; };
-  Cron job("* * * * * *", o, [&](Cron&) {
-    ++runs;
-    std::this_thread::sleep_for(std::chrono::milliseconds(2300));
-  });
-  std::this_thread::sleep_for(std::chrono::milliseconds(3200));
+  JobOptions o;
+  o.on_protect = [&](Job&) { ++blocked; };
+  Job job(
+      Cron("* * * * * *"),
+      [&] {
+        ++runs;
+        std::this_thread::sleep_for(2300ms);
+      },
+      o);
+  std::this_thread::sleep_for(3200ms);
   job.stop();
   job.join();
   CHECK_EQ(runs.load(), 1);
@@ -466,16 +530,16 @@ TEST("protect skips runs while busy and calls on_protect") {
 
 TEST("errors are passed to on_error") {
   std::atomic<int> errors{0};
-  Options o;
+  JobOptions o;
   o.max_runs = 1;
-  o.on_error = [&](std::exception_ptr e, Cron&) {
+  o.on_error = [&](std::exception_ptr e, Job&) {
     try {
       std::rethrow_exception(e);
     } catch (const std::runtime_error& err) {
       if (std::string(err.what()) == "boom") ++errors;
     }
   };
-  Cron job("* * * * * *", o, [](Cron&) { throw std::runtime_error("boom"); });
+  Job job(Cron("* * * * * *"), [] { throw std::runtime_error("boom"); }, o);
   job.join();
   CHECK_EQ(errors.load(), 1);
   CHECK(!job.is_busy());
@@ -483,11 +547,11 @@ TEST("errors are passed to on_error") {
 
 TEST("trigger runs on the calling thread and propagates exceptions") {
   int runs = 0;
-  Cron job("0 0 1 1 *", [&](Cron&) { ++runs; });
+  Job job(Cron("0 0 1 1 *"), [&] { ++runs; });
   job.trigger();
   CHECK_EQ(runs, 1);
   CHECK(job.current_run().has_value());
-  Cron failing("0 0 1 1 *", [](Cron&) { throw std::logic_error("x"); });
+  Job failing(Cron("0 0 1 1 *"), [] { throw std::logic_error("x"); });
   bool thrown = false;
   try {
     failing.trigger();
@@ -498,15 +562,22 @@ TEST("trigger runs on the calling thread and propagates exceptions") {
   CHECK(!failing.is_busy());
 }
 
-TEST("scheduling two functions throws") {
-  Cron job("0 0 1 1 *", [](Cron&) {});
-  CHECK_THROWS(job.schedule([](Cron&) {}));
+TEST("single-run job fires once") {
+  std::atomic<int> runs{0};
+  Job job(Cron::once(croner::Clock::now() + 1200ms), [&] { ++runs; });
+  job.join();
+  CHECK_EQ(runs.load(), 1);
 }
 
-TEST("one-off job fires once") {
+TEST("single-run job in the past runs only with allow_past") {
   std::atomic<int> runs{0};
-  Cron job(croner::Clock::now() + std::chrono::milliseconds(1200), [&](Cron&) { ++runs; });
-  job.join();
+  Job skipped(Cron::once("2000-01-01T00:00:00Z"), [&] { ++runs; });
+  skipped.join();
+  CHECK_EQ(runs.load(), 0);
+  JobOptions o;
+  o.allow_past = true;
+  Job allowed(Cron::once("2000-01-01T00:00:00Z"), [&] { ++runs; }, o);
+  allowed.join();
   CHECK_EQ(runs.load(), 1);
 }
 

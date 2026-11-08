@@ -5,7 +5,7 @@
 1. Done: the port has its own repository, `hexagon/croner-cpp`, like `hexagon/croner-rust`. It was
    split out of `cpp/` in hexagon/croner with its history. The differential test compares with
    the `croner` version pinned in `tests/differential/package.json`.
-2. Tag `v0.1.0` and publish a GitHub release. Users can then consume it right away with CMake
+2. Tag `v0.2.0` and publish a GitHub release. Users can then consume it right away with CMake
    `FetchContent`, CPM.cmake, or by copying the headers.
 3. Submit a **vcpkg** port and a **Conan Center** recipe, both under the package name `croner`
    (not `croner-cpp`), which is free in both (checked 2026-11-07). The CMake package and target
@@ -43,15 +43,19 @@ scheduler with overrun protection.
 
 ## Checklist before 1.0 and the package manager submissions
 
+See also [ROADMAP.md](ROADMAP.md) for the review findings and the planned API changes.
+
 - [x] CI green on Linux (GCC, Clang), macOS and Windows (MSVC C++20, `std::chrono::tzdb`).
 - [x] OCPS conformance test vectors, and differential tests against croner.js and croner-rust.
 - [ ] Fix the bugs found in croner.js (day rollover, `@weekly` with alternative weekdays, years
       1-99) and croner-rust (`*/2` year parity, stopping early over Samoa's skipped day), so the
       implementations agree again.
-- [ ] Decide on API names that are hard to change later: `croner::Cron`, `croner::Options`,
-      snake_case methods, and `croner::TimePoint` with millisecond precision.
+- [x] Decide on API names that are hard to change later: `croner::Cron`, `croner::Job`,
+      `croner::CronOptions`, `croner::JobOptions`, snake_case methods, and `croner::TimePoint`
+      with millisecond precision (0.2.0).
 - [ ] Decide whether job functions keep running on a thread per run, or whether to offer a
       pluggable executor, for example to run on an existing event loop or thread pool.
 - [ ] Generated API docs (Doxygen), or a docs page on croner.56k.guru.
-- [ ] `CHANGELOG.md`, and a statement of which croner.js version and OCPS version the port
+- [x] `CHANGELOG.md`.
+- [ ] A statement of which croner.js version and OCPS version this library
       tracks (currently croner.js 11.0.0, OCPS 1.4 with the documented DST deviation).

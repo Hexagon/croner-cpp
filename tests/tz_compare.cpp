@@ -65,7 +65,6 @@ int main(int argc, char** argv) {
       prev_offset = offset;
     }
   }
-  std::cout << names.size() << " zones, " << checks << " checks, " << mismatches
-            << " mismatches\n";
+  std::cout << names.size() << " zones, " << checks << " checks, " << mismatches << " mismatches\n";
   return mismatches ? 1 : 0;
 }

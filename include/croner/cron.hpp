@@ -1,29 +1,24 @@
 // Croner for C++ - MIT License - Hexagon <github.com/Hexagon>
 //
-// The Cron class, a port of src/croner.ts and src/options.ts
+// croner::Cron, an immutable schedule: a cron pattern or a single date, in a time zone.
 
 #ifndef CRONER_CRON_HPP
 #define CRONER_CRON_HPP
 
-#include <algorithm>
-#include <atomic>
 #include <chrono>
-#include <condition_variable>
+#include <cstddef>
 #include <cstdint>
-#include <exception>
-#include <functional>
 #include <iterator>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <utility>
 #include <variant>
 #include <vector>
 
 #include "date.hpp"
+#include "error.hpp"
 #include "pattern.hpp"
 #include "timezone.hpp"
 
@@ -33,489 +28,238 @@ using Clock = std::chrono::system_clock;
 /// Instants returned by Croner, millisecond precision
 using TimePoint = std::chrono::time_point<Clock, std::chrono::milliseconds>;
 
-/// A reference date passed to Croner: an instant, or an ISO 8601 string. Strings without "Z" or
-/// a UTC offset are read as wall clock time in the time zone of the job.
+/// A date passed to Croner: a system_clock time point, or an ISO 8601 string such as
+/// "2025-01-01", "2025-01-01T12:00:00", "2025-01-01T12:00:00.500Z" or
+/// "2025-01-01T12:00:00+02:00". A string without "Z" or a UTC offset is a wall clock time in the
+/// time zone of the schedule.
 class DateRef {
  public:
   template <class Duration>
   DateRef(std::chrono::time_point<Clock, Duration> tp)  // NOLINT(google-explicit-constructor)
       : value_(std::chrono::floor<std::chrono::milliseconds>(tp).time_since_epoch().count()) {}
-  DateRef(std::string iso) : value_(std::move(iso)) {}       // NOLINT
-  DateRef(const char* iso) : value_(std::string(iso)) {}     // NOLINT
+  DateRef(std::string iso) : value_(std::move(iso)) {}         // NOLINT
+  DateRef(const char* iso) : value_(std::string(iso)) {}       // NOLINT
   DateRef(std::string_view iso) : value_(std::string(iso)) {}  // NOLINT
 
-  static DateRef from_unix_ms(Millis ms) { return DateRef(ms, 0); }
-
-  const std::variant<Millis, std::string>& value() const { return value_; }
-
  private:
-  DateRef(Millis ms, int) : value_(ms) {}
-  std::variant<Millis, std::string> value_;
+  friend class Cron;
+  std::variant<detail::Millis, std::string> value_;
 };
 
-class Cron;
-
-/// Job function
-using Callback = std::function<void(Cron&)>;
-/// Called with the exception thrown by the job function
-using ErrorHandler = std::function<void(std::exception_ptr, Cron&)>;
-/// Called when a run is skipped because the previous run is still in progress
-using ProtectHandler = std::function<void(Cron&)>;
-
-/// Options for a job. The JavaScript `context` option is not needed in C++: capture state in the
-/// callback instead. `unref` has no equivalent, see Cron::join().
-struct Options {
-  /// Name of the job. Named jobs are listed by scheduled_jobs(), names are unique.
-  std::string name;
-  /// Start paused
-  bool paused = false;
-  /// Maximum number of scheduled runs, unlimited if not set
-  std::optional<std::int64_t> max_runs;
-  /// Catch exceptions thrown by the job function. If false and on_error is not set, an exception
-  /// thrown on the scheduler's worker thread terminates the program, like an unhandled
-  /// exception in any std::thread (and like an unhandled rejection in Node.js).
-  bool catch_errors = false;
-  /// Called with caught exceptions, implies catch_errors
-  ErrorHandler on_error;
-  /// Minimum interval between runs, in seconds
-  std::int64_t interval = 0;
-  /// Skip a run if the previous run is still in progress
-  bool protect = false;
-  /// Called when a run is skipped by protect, implies protect
-  ProtectHandler on_protect;
-  /// First allowed run, inclusive (except when interval is set)
-  std::optional<DateRef> start_at;
-  /// Last allowed run, exclusive
-  std::optional<DateRef> stop_at;
-  /// IANA time zone, e.g. "Europe/Stockholm". Default is the system local time zone.
-  std::string timezone;
-  /// Fixed UTC offset in minutes, can't be combined with timezone
-  std::optional<int> utc_offset;
-  /// A custom time zone implementation, can't be combined with timezone or utc_offset
+/// Options for a schedule. All are optional.
+struct CronOptions {
+  /// Time zone, e.g. croner::locate_zone("Europe/Stockholm") or
+  /// croner::fixed_offset_zone(std::chrono::minutes(330)). Default: the system local time zone.
   TimeZonePtr zone;
-  /// AND day-of-month and day-of-week (default is OR, like Vixie cron)
-  bool dom_and_dow = false;
-  /// Shift runs by a number of days
-  int day_offset = 0;
   /// Which pattern lengths to accept
   Mode mode = Mode::Auto;
+  /// Day-of-month AND day-of-week must match (default is OR, as in Vixie cron)
+  bool dom_and_dow = false;
   /// Quartz weekday numbering, 1 = Sunday ... 7 = Saturday
   bool alternative_weekdays = false;
   /// Allow non-standard stepping like "/10" and "5/5"
   bool sloppy_ranges = false;
-  /// Let one-off jobs scheduled in the past fire immediately
-  bool allow_past = false;
+  /// Shift every run by a number of days
+  int day_offset = 0;
+  /// First allowed run, inclusive (with an interval: the first run, and the interval is counted
+  /// from it)
+  std::optional<DateRef> start_at;
+  /// Runs must be before this, exclusive
+  std::optional<DateRef> stop_at;
+  /// Minimum time between runs, in whole seconds
+  std::chrono::seconds interval{0};
 };
 
-namespace detail {
-inline std::mutex& registry_mutex() {
-  static std::mutex m;
-  return m;
-}
-inline std::vector<Cron*>& registry() {
-  static std::vector<Cron*> r;
-  return r;
-}
-inline Millis now_ms() {
-  return std::chrono::duration_cast<std::chrono::milliseconds>(
-             Clock::now().time_since_epoch())
-      .count();
-}
-inline TimePoint to_time_point(Millis ms) { return TimePoint{std::chrono::milliseconds{ms}}; }
-inline std::optional<TimePoint> to_time_point(const std::optional<Millis>& ms) {
-  if (!ms) return std::nullopt;
-  return to_time_point(*ms);
-}
-}  // namespace detail
-
-/// Named jobs that have not been stopped
-inline std::vector<Cron*> scheduled_jobs() {
-  std::lock_guard<std::mutex> lock(detail::registry_mutex());
-  return detail::registry();
-}
-
 /// ISO 8601 representation in UTC, e.g. "2025-01-01T00:00:00.000Z"
-inline std::string to_iso_string(TimePoint tp) {
+[[nodiscard]] inline std::string to_iso_string(TimePoint tp) {
   return detail::to_iso_string(tp.time_since_epoch().count());
 }
 
-class CronIterator;
+class RunRange;
+class Job;
 
-/// A cron job: evaluates a pattern (or a one-off date), and optionally runs a function on a
-/// background thread when it is due.
+/// A schedule: a cron pattern, or a single date, in a time zone.
 ///
-/// Job functions run on a new thread per run, so runs may overlap unless `protect` is set.
-/// A Cron object can't be copied or moved, as running jobs refer to it. Destroying it stops the
-/// job and waits for running job functions to finish, so it must not be destroyed from inside
-/// its own job function.
+/// Immutable and cheap to copy (copies share the parsed pattern). All member functions are
+/// const and safe to call from several threads at once.
+///
+///     croner::Cron cron("0 30 9 * * MON-FRI");
+///     auto next = cron.next_run();
 class Cron {
  public:
-  /// A pattern, or an ISO 8601 date string for a one-off job
-  explicit Cron(std::string pattern, Options options = {}, Callback fn = {})
-      : options_(std::move(options)) {
-    init(std::move(pattern), std::nullopt, std::move(fn));
+  /// @throws CronError if the pattern or an option is invalid
+  explicit Cron(std::string_view pattern, CronOptions options = {}) {
+    auto d = make_data(std::move(options));
+    detail::PatternOptions po;
+    po.mode = d->options.mode;
+    po.alternative_weekdays = d->options.alternative_weekdays;
+    po.sloppy_ranges = d->options.sloppy_ranges;
+    d->pattern.emplace(pattern, po);
+    d->search.has_nearest_weekdays = d->pattern->nearest_weekdays.any();
+    d_ = std::move(d);
   }
 
-  Cron(std::string pattern, Callback fn) : Cron(std::move(pattern), Options{}, std::move(fn)) {}
-
-  /// A one-off job at an instant
-  template <class Duration>
-  explicit Cron(std::chrono::time_point<Clock, Duration> once, Options options = {},
-                Callback fn = {})
-      : options_(std::move(options)) {
-    init("", DateRef(once), std::move(fn));
+  /// A schedule with a single run, at `at`
+  /// @throws CronError if the date or an option is invalid
+  [[nodiscard]] static Cron once(const DateRef& at, CronOptions options = {}) {
+    Cron c;
+    auto d = make_data(std::move(options));
+    d->once = to_cron_date(*d, at).get_time();
+    c.d_ = std::move(d);
+    return c;
   }
 
-  template <class Duration>
-  Cron(std::chrono::time_point<Clock, Duration> once, Callback fn)
-      : Cron(once, Options{}, std::move(fn)) {}
-
-  Cron(const Cron&) = delete;
-  Cron& operator=(const Cron&) = delete;
-  Cron(Cron&&) = delete;
-  Cron& operator=(Cron&&) = delete;
-
-  ~Cron() {
-    stop();
-    join();
+  /// The next run after `after` (default now). With an interval, `after` counts as a previous
+  /// run.
+  [[nodiscard]] std::optional<TimePoint> next_run(
+      const std::optional<DateRef>& after = std::nullopt) const {
+    return to_time_point(next_target(ref_ms(after), now_ms(), std::nullopt, false));
   }
 
-  /// Next run, after `prev` (default now)
-  std::optional<TimePoint> next_run(const std::optional<DateRef>& prev = std::nullopt) const {
-    std::lock_guard<std::recursive_mutex> lock(mtx_);
-    return detail::to_time_point(next_target(ref_ms(prev), detail::now_ms()));
+  /// The next n runs after `after` (default now)
+  [[nodiscard]] std::vector<TimePoint> next_runs(
+      std::size_t n, const std::optional<DateRef>& after = std::nullopt) const {
+    return enumerate_runs(n, ref_ms(after), 1);
   }
 
-  /// Next n runs, after `previous` (default the current run, or now)
-  std::vector<TimePoint> next_runs(std::size_t n,
-                                   const std::optional<DateRef>& previous = std::nullopt) const {
-    std::lock_guard<std::recursive_mutex> lock(mtx_);
-    if (max_runs_ && static_cast<std::int64_t>(n) > *max_runs_) {
-      n = *max_runs_ > 0 ? static_cast<std::size_t>(*max_runs_) : 0;
-    }
-    std::optional<Millis> start = ref_ms(previous);
-    if (!start && current_run_) start = current_run_->get_time();
-    return enumerate_runs(n, start, 1);
+  /// The last run before `before` (default now)
+  [[nodiscard]] std::optional<TimePoint> previous_run(
+      const std::optional<DateRef>& before = std::nullopt) const {
+    const auto runs = enumerate_runs(1, ref_ms(before), -1);
+    if (runs.empty()) return std::nullopt;
+    return runs.front();
   }
 
-  /// Previous n runs, most recent first, before `reference` (default now)
-  std::vector<TimePoint> previous_runs(std::size_t n,
-                                       const std::optional<DateRef>& reference = std::nullopt) const {
-    std::lock_guard<std::recursive_mutex> lock(mtx_);
-    return enumerate_runs(n, ref_ms(reference), -1);
+  /// The last n runs before `before` (default now), most recent first
+  [[nodiscard]] std::vector<TimePoint> previous_runs(
+      std::size_t n, const std::optional<DateRef>& before = std::nullopt) const {
+    return enumerate_runs(n, ref_ms(before), -1);
   }
 
-  /// Iterate over upcoming runs, after `start_at` (default now)
-  CronIterator enumerate(const std::optional<DateRef>& start_at = std::nullopt) const;
-
-  /// Whether a date matches the pattern (or the one-off date), at second precision
-  bool match(const DateRef& date) const {
-    std::lock_guard<std::recursive_mutex> lock(mtx_);
-    CronDate check = to_cron_date(date);
-    check.ms = 0;
-    if (once_) {
-      CronDate once = *once_;
-      once.ms = 0;
-      return check.get_time() == once.get_time();
-    }
-    return check.match(pattern_, search_);
-  }
-
-  /// The pattern, or nullopt for one-off jobs
-  std::optional<std::string> get_pattern() const {
-    if (once_) return std::nullopt;
-    return pattern_.pattern;
-  }
-
-  /// The date of a one-off job
-  std::optional<TimePoint> get_once() const {
-    if (!once_) return std::nullopt;
-    return detail::to_time_point(once_->get_time());
-  }
-
-  /// Scheduled, not paused or stopped, and has a next run
-  bool is_running() const {
-    std::lock_guard<std::recursive_mutex> lock(mtx_);
-    if (paused_ || kill_ || !fn_) return false;
-    std::optional<Millis> cur;
-    if (current_run_) cur = current_run_->get_time();
-    return next_target(cur, detail::now_ms()).has_value();
-  }
-
-  bool is_stopped() const {
-    std::lock_guard<std::recursive_mutex> lock(mtx_);
-    return kill_;
-  }
-
-  /// A job function is running
-  bool is_busy() const {
-    std::lock_guard<std::recursive_mutex> lock(mtx_);
-    return blocking_;
-  }
-
-  /// Start of the current (or last started) run
-  std::optional<TimePoint> current_run() const {
-    std::lock_guard<std::recursive_mutex> lock(mtx_);
-    if (!current_run_) return std::nullopt;
-    return detail::to_time_point(current_run_->get_time());
-  }
-
-  /// Start of the last finished run
-  std::optional<TimePoint> previous_run() const {
-    std::lock_guard<std::recursive_mutex> lock(mtx_);
-    if (!previous_run_) return std::nullopt;
-    return detail::to_time_point(previous_run_->get_time());
-  }
-
-  /// Milliseconds until the next run, after `prev` (default now)
-  std::optional<std::chrono::milliseconds> ms_to_next(
-      const std::optional<DateRef>& prev = std::nullopt) const {
-    std::lock_guard<std::recursive_mutex> lock(mtx_);
-    const Millis now = detail::now_ms();
-    const std::optional<Millis> reference = ref_ms(prev);
-    const auto next = next_target(reference, now);
+  /// Time from `after` (default now) until the next run
+  [[nodiscard]] std::optional<std::chrono::milliseconds> time_to_next(
+      const std::optional<DateRef>& after = std::nullopt) const {
+    const detail::Millis now = now_ms();
+    const auto reference = ref_ms(after);
+    const auto next = next_target(reference, now, std::nullopt, false);
     if (!next) return std::nullopt;
     return std::chrono::milliseconds{*next - (reference ? *reference : now)};
   }
 
-  /// Stop the job permanently. A running job function finishes.
-  void stop() {
-    {
-      std::lock_guard<std::recursive_mutex> lock(mtx_);
-      kill_ = true;
+  /// Whether a date is a run of this schedule, at second precision
+  [[nodiscard]] bool match(const DateRef& date) const {
+    detail::CronDate check = to_cron_date(*d_, date);
+    check.ms = 0;
+    if (d_->once) {
+      return check.get_time() == detail::floor_div(*d_->once, 1000) * 1000;
     }
-    cv_.notify_all();
-    std::lock_guard<std::mutex> lock(detail::registry_mutex());
-    auto& r = detail::registry();
-    r.erase(std::remove(r.begin(), r.end(), this), r.end());
+    return check.match(*d_->pattern, d_->search);
   }
 
-  /// Pause the job. Returns false if the job is stopped.
-  bool pause() {
-    std::lock_guard<std::recursive_mutex> lock(mtx_);
-    paused_ = true;
-    return !kill_;
+  /// Upcoming runs after `after` (default now), for use with range-for. Infinite for most
+  /// patterns, so break out of the loop.
+  [[nodiscard]] RunRange runs(const std::optional<DateRef>& after = std::nullopt) const;
+
+  /// The pattern, with nicknames such as "@daily" expanded. Empty for a single-run schedule.
+  [[nodiscard]] const std::string& pattern() const {
+    static const std::string empty;
+    return d_->pattern ? d_->pattern->pattern : empty;
   }
 
-  /// Resume the job. Returns false if the job is stopped.
-  bool resume() {
-    std::lock_guard<std::recursive_mutex> lock(mtx_);
-    paused_ = false;
-    return !kill_;
-  }
+  /// The run of a single-run schedule, nullopt for patterns
+  [[nodiscard]] std::optional<TimePoint> once_at() const { return to_time_point(d_->once); }
 
-  /// Start running `fn` (or the function given to the constructor) when the job is due
-  Cron& schedule(Callback fn = {}) {
-    std::unique_lock<std::recursive_mutex> lock(mtx_);
-    if (fn && fn_) {
-      throw CronError(
-          "Cron: It is not allowed to schedule two functions using the same Croner instance.");
-    }
-    if (fn) fn_ = std::move(fn);
-    if (scheduler_active_) return *this;
-    const auto plan = compute_schedule(detail::now_ms());
-    if (!plan) return *this;
-    if (scheduler_.joinable()) scheduler_.join();  // a finished scheduler thread
-    scheduler_active_ = true;
-    scheduler_ = std::thread([this, plan] { run_scheduler(plan->first, plan->second); });
-    return *this;
-  }
-
-  /// Run the job function now, on the calling thread. Exceptions propagate unless catch_errors
-  /// or on_error is set.
-  void trigger() {
-    const Millis now = detail::now_ms();
-    {
-      std::lock_guard<std::recursive_mutex> lock(mtx_);
-      begin_run(now);
-    }
-    run_job(now);
-  }
-
-  /// Remaining scheduled runs, nullopt if unlimited
-  std::optional<std::int64_t> runs_left() const {
-    std::lock_guard<std::recursive_mutex> lock(mtx_);
-    return max_runs_;
-  }
-
-  const std::string& name() const { return options_.name; }
-  const Options& options() const { return options_; }
-  const TimeZonePtr& zone() const { return tz_; }
-
-  /// Block until the job has no more runs (or is stopped) and running job functions have
-  /// finished. Must not be called from the job function.
-  void join() {
-    std::thread scheduler;
-    {
-      std::lock_guard<std::recursive_mutex> lock(mtx_);
-      scheduler = std::move(scheduler_);
-    }
-    if (scheduler.joinable()) {
-      if (scheduler.get_id() == std::this_thread::get_id()) {
-        scheduler.detach();
-      } else {
-        scheduler.join();
-      }
-    }
-    std::vector<Worker> workers;
-    {
-      std::lock_guard<std::mutex> lock(workers_mtx_);
-      workers.swap(workers_);
-    }
-    for (auto& w : workers) {
-      if (!w.thread.joinable()) continue;
-      if (w.thread.get_id() == std::this_thread::get_id()) {
-        w.thread.detach();
-      } else {
-        w.thread.join();
-      }
-    }
-  }
+  [[nodiscard]] const CronOptions& options() const noexcept { return d_->options; }
+  [[nodiscard]] const TimeZonePtr& zone() const noexcept { return d_->tz; }
 
  private:
-  friend class CronIterator;
+  friend class RunRange;
+  friend class Job;
+  using Millis = detail::Millis;
+  using CronDate = detail::CronDate;
 
-  struct Worker {
-    std::thread thread;
-    std::shared_ptr<std::atomic<bool>> done;
+  struct Data {
+    CronOptions options;
+    TimeZonePtr tz;
+    detail::SearchOptions search;
+    std::optional<detail::CronPattern> pattern;
+    std::optional<Millis> once;
+    std::optional<Millis> start_at;
+    std::optional<Millis> stop_at;
+    Millis start_at_rounding_ms = 0;
   };
+  std::shared_ptr<const Data> d_;
 
-  Options options_;
-  TimeZonePtr tz_;
-  SearchOptions search_;
-  CronPattern pattern_{"* * * * *"};
-  std::optional<CronDate> once_;
-  std::optional<Millis> start_at_;
-  std::optional<Millis> stop_at_;
-  Millis start_at_rounding_ms_ = 0;
+  Cron() = default;
 
-  // State
-  bool kill_ = false;
-  bool blocking_ = false;
-  bool paused_ = false;
-  std::optional<CronDate> previous_run_;
-  std::optional<CronDate> current_run_;
-  std::optional<std::int64_t> max_runs_;
-  Callback fn_;
-
-  // Threads
-  mutable std::recursive_mutex mtx_;
-  std::condition_variable_any cv_;
-  std::thread scheduler_;
-  bool scheduler_active_ = false;
-  std::mutex workers_mtx_;
-  std::vector<Worker> workers_;
-
-  static constexpr Millis MAX_DELAY_MS = 30000;
-
-  void init(std::string pattern, std::optional<DateRef> once, Callback fn) {
-    Options& o = options_;
-    if (o.interval < 0) throw CronError("CronOptions: Supplied value for interval can not be negative");
-    if (o.utc_offset) {
-      if (*o.utc_offset < -870 || *o.utc_offset > 870) {
-        throw CronError("CronOptions: utcOffset out of bounds.");
-      }
-      if (!o.timezone.empty()) {
-        throw CronError("CronOptions: Combining 'utcOffset' with 'timezone' is not allowed.");
-      }
+  static std::shared_ptr<Data> make_data(CronOptions options) {
+    auto d = std::make_shared<Data>();
+    d->options = std::move(options);
+    const CronOptions& o = d->options;
+    if (o.interval.count() < 0) {
+      throw CronError(CronError::Kind::Option, "interval must not be negative");
     }
-    if (o.zone && (!o.timezone.empty() || o.utc_offset)) {
-      throw CronError("CronOptions: Combining 'zone' with 'timezone' or 'utcOffset' is not allowed.");
-    }
-    if (o.on_error) o.catch_errors = true;
-    if (o.on_protect) o.protect = true;
-
-    if (o.zone) {
-      tz_ = o.zone;
-    } else if (!o.timezone.empty()) {
-      tz_ = locate_zone(o.timezone);
-    } else if (o.utc_offset) {
-      tz_ = fixed_offset_zone(*o.utc_offset);
-    } else {
-      tz_ = local_zone();
-    }
-    search_.dom_and_dow = o.dom_and_dow;
-    search_.interval = o.interval;
+    d->tz = o.zone ? o.zone : local_zone();
+    d->search.dom_and_dow = o.dom_and_dow;
+    d->search.interval = static_cast<std::int64_t>(o.interval.count());
 
     // Runs are on whole seconds, so a time between two seconds counts as the next second
     const auto to_whole_second = [](Millis ms) {
       return detail::floor_mod(ms, 1000) != 0 ? detail::floor_div(ms, 1000) * 1000 + 1000 : ms;
     };
     if (o.start_at) {
-      const Millis raw = to_cron_date(*o.start_at).get_time();
-      start_at_ = to_whole_second(raw);
-      start_at_rounding_ms_ = *start_at_ - raw;
+      const Millis raw = to_cron_date(*d, *o.start_at).get_time();
+      d->start_at = to_whole_second(raw);
+      d->start_at_rounding_ms = *d->start_at - raw;
     }
-    if (o.stop_at) stop_at_ = to_whole_second(to_cron_date(*o.stop_at).get_time());
-
-    paused_ = o.paused;
-    max_runs_ = o.max_runs;
-
-    if (once) {
-      once_ = to_cron_date(*once);
-    } else if (const auto colon = pattern.find(':'); colon != std::string::npos && colon > 0) {
-      once_ = CronDate(std::string_view(pattern), tz_);
-    } else {
-      PatternOptions po;
-      po.mode = o.mode;
-      po.alternative_weekdays = o.alternative_weekdays;
-      po.sloppy_ranges = o.sloppy_ranges;
-      pattern_ = CronPattern(std::move(pattern), po);
-    }
-
-    if (!o.name.empty()) {
-      std::lock_guard<std::mutex> lock(detail::registry_mutex());
-      auto& r = detail::registry();
-      for (const Cron* j : r) {
-        if (j->name() == o.name) {
-          throw CronError("Cron: Tried to initialize new named job '" + o.name +
-                          "', but name already taken.");
-        }
-      }
-      r.push_back(this);
-    }
-
-    if (fn) {
-      try {
-        schedule(std::move(fn));
-      } catch (...) {
-        stop();
-        throw;
-      }
-    }
+    if (o.stop_at) d->stop_at = to_whole_second(to_cron_date(*d, *o.stop_at).get_time());
+    return d;
   }
 
-  CronDate to_cron_date(const DateRef& ref) const {
-    if (const auto* ms = std::get_if<Millis>(&ref.value())) return CronDate(*ms, tz_);
-    return CronDate(std::string_view(std::get<std::string>(ref.value())), tz_);
+  static Millis now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch())
+        .count();
   }
 
-  Millis to_ms(const DateRef& ref) const {
-    if (const auto* ms = std::get_if<Millis>(&ref.value())) return *ms;
-    return to_cron_date(ref).get_time();
+  static std::optional<TimePoint> to_time_point(const std::optional<Millis>& ms) {
+    if (!ms) return std::nullopt;
+    return TimePoint{std::chrono::milliseconds{*ms}};
+  }
+
+  static CronDate to_cron_date(const Data& d, const DateRef& ref) {
+    if (const auto* ms = std::get_if<Millis>(&ref.value_)) return CronDate(*ms, d.tz);
+    return CronDate(std::string_view(std::get<std::string>(ref.value_)), d.tz);
   }
 
   std::optional<Millis> ref_ms(const std::optional<DateRef>& ref) const {
     if (!ref) return std::nullopt;
-    return to_ms(*ref);
+    if (const auto* ms = std::get_if<Millis>(&ref->value_)) return *ms;
+    return to_cron_date(*d_, *ref).get_time();
   }
 
-  Millis offset_ms() const { return static_cast<Millis>(options_.day_offset) * detail::MS_PER_DAY; }
+  Millis offset_ms() const {
+    return static_cast<Millis>(d_->options.day_offset) * detail::MS_PER_DAY;
+  }
 
   std::optional<CronDate> shift(const std::optional<Millis>& ms) const {
     if (!ms) return std::nullopt;
-    return CronDate(*ms - offset_ms(), tz_);
+    return CronDate(*ms - offset_ms(), d_->tz);
   }
 
-  std::optional<Millis> next_target(const std::optional<Millis>& reference, Millis now) const {
-    const auto next = next_(shift(reference), now - offset_ms(), shift(start_at_), shift(stop_at_));
+  /// The next run after `reference`, or after `now` if there is no reference.
+  /// `last_run` is the last run of a job using this schedule, and `allow_past` lets a single run
+  /// in the past be returned (both for Job).
+  std::optional<Millis> next_target(const std::optional<Millis>& reference, Millis now,
+                                    const std::optional<Millis>& last_run, bool allow_past) const {
+    const auto next = next_(shift(reference), now - offset_ms(), shift(d_->start_at),
+                            shift(d_->stop_at), last_run, allow_past);
     if (!next) return std::nullopt;
     return next->get_time() + offset_ms();
   }
 
   std::optional<Millis> previous_target(const std::optional<Millis>& reference, Millis now) const {
-    const auto previous = previous_(*shift(reference ? *reference : now), shift(start_at_),
-                                    shift(stop_at_));
+    const auto previous =
+        previous_(*shift(reference ? *reference : now), shift(d_->start_at), shift(d_->stop_at));
     if (!previous) return std::nullopt;
     return previous->get_time() + offset_ms();
   }
@@ -523,11 +267,12 @@ class Cron {
   std::vector<TimePoint> enumerate_runs(std::size_t n, std::optional<Millis> current,
                                         int direction) const {
     std::vector<TimePoint> out;
-    const Millis now = detail::now_ms();
+    const Millis now = now_ms();
     while (n-- > 0) {
-      const auto run = direction == 1 ? next_target(current, now) : previous_target(current, now);
+      const auto run = direction == 1 ? next_target(current, now, std::nullopt, false)
+                                      : previous_target(current, now);
       if (!run) break;
-      out.push_back(detail::to_time_point(*run));
+      out.push_back(*to_time_point(run));
       current = run;
     }
     return out;
@@ -535,51 +280,47 @@ class Cron {
 
   std::optional<CronDate> next_(std::optional<CronDate> previous_run, Millis now,
                                 const std::optional<CronDate>& start_at,
-                                const std::optional<CronDate>& stop_at) const {
+                                const std::optional<CronDate>& stop_at,
+                                const std::optional<Millis>& last_run, bool allow_past) const {
     const bool is_enumerating = previous_run.has_value();
-    bool has_previous_run = previous_run.has_value() || current_run_.has_value();
+    bool has_previous_run = previous_run.has_value() || last_run.has_value();
 
-    // If no previous run, and startAt and interval is set, calculate when the last run should
-    // have been
+    // With start_at and an interval, and no previous run: when the last run should have been
     bool start_at_in_future_with_interval = false;
-    if (!previous_run && start_at && options_.interval) {
+    if (!previous_run && start_at && d_->search.interval) {
       previous_run = calculate_previous_run(*start_at, now);
       if (previous_run) has_previous_run = true;
       start_at_in_future_with_interval = !previous_run;
     }
 
     // Search from the exact reference instant
-    CronDate prev = previous_run ? *previous_run : CronDate(now, tz_);
+    CronDate prev = previous_run ? *previous_run : CronDate(now, d_->tz);
     Millis reference_ms = prev.get_time();
 
-    // Previous run should never be before startAt
+    // Never search from before start_at
     if (start_at && reference_ms < start_at->get_time()) {
       prev = start_at_in_future_with_interval ? *start_at
-                                              : CronDate(start_at->get_time() - 1000, tz_);
+                                              : CronDate(start_at->get_time() - 1000, d_->tz);
       reference_ms = prev.get_time();
     }
 
     std::optional<CronDate> next_run;
-    if (once_) {
-      next_run = once_;
+    if (d_->once) {
+      const Millis once_ms = *d_->once;
+      const Millis past_ms = reference_ms - once_ms;
+      if ((start_at && once_ms < start_at->get_time() - d_->start_at_rounding_ms) ||
+          (last_run && once_ms + offset_ms() <= *last_run) ||
+          (is_enumerating ? past_ms >= 0 : (past_ms > 1000 && !allow_past))) {
+        return std::nullopt;
+      }
+      next_run = CronDate(once_ms, d_->tz);
     } else if (start_at_in_future_with_interval) {
       next_run = prev;
     } else {
       next_run = find_occurrence(prev, reference_ms, 1, has_previous_run);
     }
 
-    if (once_) {
-      const Millis once_ms = once_->get_time();
-      const Millis past_ms = reference_ms - once_ms;
-      if ((start_at && once_ms < start_at->get_time() - start_at_rounding_ms_) ||
-          (current_run_ && once_ms + offset_ms() <= current_run_->get_time()) ||
-          (is_enumerating ? past_ms >= 0 : (past_ms > 1000 && !options_.allow_past))) {
-        return std::nullopt;
-      }
-    }
-
-    if (!next_run || (max_runs_ && *max_runs_ <= 0) || kill_ ||
-        (stop_at && next_run->get_time() >= stop_at->get_time())) {
+    if (!next_run || (stop_at && next_run->get_time() >= stop_at->get_time())) {
       return std::nullopt;
     }
     return next_run;
@@ -591,52 +332,58 @@ class Cron {
     Millis reference_ms = reference.get_time();
     if (stop_at && reference_ms > stop_at->get_time()) reference_ms = stop_at->get_time();
 
-    if (once_) {
-      if (once_->get_time() < reference_ms) return once_;
+    if (d_->once) {
+      if (*d_->once < reference_ms) return CronDate(*d_->once, d_->tz);
       return std::nullopt;
     }
 
-    const auto previous = find_occurrence(CronDate(reference_ms, tz_), reference_ms, -1, false);
-    if (!previous || (start_at && previous->get_time() < start_at->get_time())) return std::nullopt;
+    const auto previous = find_occurrence(CronDate(reference_ms, d_->tz), reference_ms, -1, false);
+    if (!previous || (start_at && previous->get_time() < start_at->get_time())) {
+      return std::nullopt;
+    }
     return previous;
   }
 
-  /// The run after (direction 1) or before (-1) referenceMs, found by walking the pattern's
+  /// The run after (direction 1) or before (-1) reference_ms, found by walking the pattern's
   /// wall clock times from start. Searches both passes of a repeated local time when the
   /// reference is on one of them.
-  std::optional<CronDate> find_occurrence(const CronDate& start, Millis reference_ms,
-                                          int direction, bool has_previous_run) const {
+  std::optional<CronDate> find_occurrence(const CronDate& start, Millis reference_ms, int direction,
+                                          bool has_previous_run) const {
+    const auto& tz = *d_->tz;
     const auto found = walk(start, reference_ms, direction, has_previous_run, false);
     // A fixed-time job never runs on the later pass, and a fixed UTC offset has no DST
-    if ((pattern_.is_fixed_time && direction == 1) || tz_->is_fixed()) return found;
-    if (detail::fold_of(reference_ms, *tz_) !=
+    if ((d_->pattern->is_fixed_time && direction == 1) || tz.is_fixed()) return found;
+    if (detail::fold_of(reference_ms, tz) !=
         (direction == 1 ? detail::Fold::Earlier : detail::Fold::Later)) {
       return found;
     }
     // The other pass starts when the clock goes back, and ends just before it
     const Millis ms = detail::floor_div(reference_ms, 1000) * 1000;
     const Millis edge = direction == 1
-                            ? detail::find_offset_change(ms, ms + detail::MS_PER_DAY, *tz_)
-                            : detail::find_offset_change(ms - detail::MS_PER_DAY, ms, *tz_) - 1000;
+                            ? detail::find_offset_change(ms, ms + detail::MS_PER_DAY, tz)
+                            : detail::find_offset_change(ms - detail::MS_PER_DAY, ms, tz) - 1000;
     // A match before the edge beats anything on the other pass
     if (found && (edge - found->get_time()) * direction > 0) return found;
-    const auto other = walk(CronDate(edge, tz_), edge - direction, direction, false, true);
+    const auto other = walk(CronDate(edge, d_->tz), edge - direction, direction, false, true);
     if (!found || !other) return found ? found : other;
     return (found->get_time() - other->get_time()) * direction > 0 ? other : found;
   }
 
   std::optional<CronDate> walk(const CronDate& start, Millis reference_ms, int direction,
                                bool has_previous_run, bool inclusive) const {
+    const auto& pattern = *d_->pattern;
     const auto step = [&](CronDate& d, bool has_previous) {
-      return direction == 1 ? d.increment(pattern_, search_, has_previous)
-                            : d.decrement(pattern_, search_);
+      return direction == 1 ? d.increment(pattern, d_->search, has_previous)
+                            : d.decrement(pattern, d_->search);
     };
     CronDate candidate = start;
     bool ok = true;
-    if (!inclusive || !candidate.match(pattern_, search_)) ok = step(candidate, has_previous_run);
+    if (!inclusive || !candidate.match(pattern, d_->search)) {
+      ok = step(candidate, has_previous_run);
+    }
     while (ok) {
       if (const auto run_at = run_at_(candidate, reference_ms, direction)) {
-        return CronDate(*run_at, tz_);
+        return CronDate(*run_at, d_->tz);
       }
       ok = step(candidate, false);
     }
@@ -646,8 +393,9 @@ class Cron {
   /// When a candidate wall clock time runs, if it is ahead of the reference
   std::optional<Millis> run_at_(const CronDate& candidate, Millis reference_ms,
                                 int direction) const {
+    const auto& tz = *d_->tz;
     const auto is_ahead = [&](Millis d) { return (d - reference_ms) * direction > 0; };
-    if (tz_->is_fixed()) {
+    if (tz.is_fixed()) {
       const Millis d = candidate.get_time();
       if (is_ahead(d)) return d;
       return std::nullopt;
@@ -659,8 +407,8 @@ class Cron {
     local.hour = candidate.hour;
     local.minute = candidate.minute;
     local.second = candidate.second;
-    const auto r = detail::resolve_local(local, *tz_);
-    const bool fixed_time = pattern_.is_fixed_time;
+    const auto r = detail::resolve_local(local, tz);
+    const bool fixed_time = d_->pattern->is_fixed_time;
     if (r.kind == detail::LocalResolution::Single) {
       if (is_ahead(r.a)) return r.a;
       return std::nullopt;
@@ -678,8 +426,8 @@ class Cron {
     }
     // In a DST gap: fixed-time jobs run when the gap ends, on the same day
     if (!fixed_time) return std::nullopt;
-    const Millis gap_end = detail::find_offset_change(r.a, r.b, *tz_);
-    const detail::DateTime gl = detail::to_tz(gap_end, *tz_);
+    const Millis gap_end = detail::find_offset_change(r.a, r.b, tz);
+    const detail::DateTime gl = detail::to_tz(gap_end, tz);
     const bool same_day = gl.year == local.year && gl.month == local.month && gl.day == local.day;
     if (same_day && is_ahead(gap_end)) return gap_end;
     return std::nullopt;
@@ -687,175 +435,43 @@ class Cron {
 
   std::optional<CronDate> calculate_previous_run(const CronDate& start_at, Millis now) const {
     if (start_at.get_time() > now) return std::nullopt;
-    const Millis interval_ms = options_.interval * 1000;
+    const Millis interval_ms = d_->search.interval * 1000;
     CronDate previous = start_at;
     while (previous.get_time() + interval_ms <= now) {
       CronDate next = previous;
-      if (!next.increment(pattern_, search_, true)) break;
+      if (!next.increment(*d_->pattern, d_->search, true)) break;
       previous = next;
     }
     return previous;
   }
-
-  /// When to check next, and the target time: (target, wait ms)
-  std::optional<std::pair<Millis, Millis>> compute_schedule(Millis current_time) const {
-    const auto next = next_target(std::nullopt, current_time);
-    if (!next) return std::nullopt;
-    Millis wait = *next - current_time;
-    // If the clock has stepped backward (currentRun > now), use the current time instead
-    std::optional<Millis> previous;
-    if (current_run_) previous = current_run_->get_time();
-    if (previous && *previous > current_time) previous.reset();
-    const auto target = next_target(previous, current_time);
-    if (!target) return std::nullopt;
-    if (wait > MAX_DELAY_MS) wait = MAX_DELAY_MS;
-    if (wait < 0) wait = paused_ ? 1000 : 0;
-    return std::make_pair(*target, wait);
-  }
-
-  void run_scheduler(Millis target, Millis wait_ms) {
-    std::unique_lock<std::recursive_mutex> lock(mtx_);
-    for (;;) {
-      const auto deadline = Clock::now() + std::chrono::milliseconds(wait_ms);
-      cv_.wait_until(lock, deadline, [this] { return kill_; });
-      if (kill_) break;
-
-      const Millis now = detail::now_ms();
-      const bool should_run = !paused_ && now >= target;
-      const bool is_blocked = blocking_ && options_.protect;
-      if (should_run && !is_blocked) {
-        if (max_runs_) --*max_runs_;
-        begin_run(now);
-        spawn_worker(now);
-      } else if (should_run && is_blocked && options_.on_protect) {
-        const ProtectHandler handler = options_.on_protect;
-        lock.unlock();
-        try {
-          handler(*this);
-        } catch (...) {
-        }
-        lock.lock();
-        if (kill_) break;
-      }
-
-      const auto plan = compute_schedule(should_run ? detail::now_ms() : now);
-      if (!plan) break;
-      target = plan->first;
-      wait_ms = plan->second;
-    }
-    scheduler_active_ = false;
-  }
-
-  void begin_run(Millis now) {
-    blocking_ = true;
-    current_run_ = CronDate(now, tz_);
-  }
-
-  void spawn_worker(Millis now) {
-    std::lock_guard<std::mutex> lock(workers_mtx_);
-    // Reap finished workers
-    for (auto it = workers_.begin(); it != workers_.end();) {
-      if (it->done->load()) {
-        it->thread.join();
-        it = workers_.erase(it);
-      } else {
-        ++it;
-      }
-    }
-    auto done = std::make_shared<std::atomic<bool>>(false);
-    workers_.push_back(Worker{std::thread([this, now, done] {
-                                run_job(now);
-                                done->store(true);
-                              }),
-                              done});
-  }
-
-  void run_job(Millis initiation) {
-    Callback fn;
-    bool catch_errors;
-    ErrorHandler on_error;
-    {
-      std::lock_guard<std::recursive_mutex> lock(mtx_);
-      fn = fn_;
-      catch_errors = options_.catch_errors;
-      on_error = options_.on_error;
-    }
-    struct Finish {
-      Cron* self;
-      Millis initiation;
-      ~Finish() {
-        std::lock_guard<std::recursive_mutex> lock(self->mtx_);
-        self->previous_run_ = CronDate(initiation, self->tz_);
-        self->blocking_ = false;
-      }
-    } finish{this, initiation};
-
-    if (catch_errors) {
-      try {
-        if (fn) fn(*this);
-      } catch (...) {
-        if (on_error) {
-          try {
-            on_error(std::current_exception(), *this);
-          } catch (...) {
-            // Errors from the error handler are ignored
-          }
-        }
-      }
-    } else if (fn) {
-      fn(*this);
-    }
-  }
 };
 
-/// Iterates over upcoming runs. Usable with range-for:
+/// Upcoming runs of a schedule. Usable with range-for:
 ///
-///     for (auto run : job.enumerate()) { ... }
+///     for (auto run : cron.runs()) { ... }
 ///
-/// Patterns without an end date are infinite, so break out of the loop.
-class CronIterator {
+/// Holds a copy of the schedule, so it may outlive the Cron it came from.
+class RunRange {
  public:
-  CronIterator(const Cron& cron, const std::optional<DateRef>& start_at) : cron_(&cron) {
-    initial_max_runs_ = cron.runs_left();
-    reset(start_at);
-  }
+  RunRange(Cron cron, const std::optional<DateRef>& after)
+      : cron_(std::move(cron)), cursor_(cron_.ref_ms(after)), now_(Cron::now_ms()) {}
 
-  /// The next run, nullopt when done
+  /// The next run, nullopt when there are no more
   std::optional<TimePoint> next() {
-    if (done_ || (remaining_ && *remaining_ <= 0)) {
-      done_ = true;
-      return std::nullopt;
-    }
-    std::optional<Millis> next_date;
-    {
-      std::lock_guard<std::recursive_mutex> lock(cron_->mtx_);
-      next_date = cron_->next_target(cursor_, now_);
-    }
+    if (done_) return std::nullopt;
+    const auto next_date = cron_.next_target(cursor_, now_, std::nullopt, false);
     if (!next_date) {
       done_ = true;
       return std::nullopt;
     }
     cursor_ = next_date;
-    if (remaining_) --*remaining_;
-    return detail::to_time_point(*next_date);
+    return Cron::to_time_point(next_date);
   }
 
   /// The next run without advancing
-  std::optional<TimePoint> peek() const {
-    if (done_ || (remaining_ && *remaining_ <= 0)) return std::nullopt;
-    std::lock_guard<std::recursive_mutex> lock(cron_->mtx_);
-    return detail::to_time_point(cron_->next_target(cursor_, now_));
-  }
-
-  /// Restart from a new start date (default now)
-  void reset(const std::optional<DateRef>& start_at = std::nullopt) {
-    {
-      std::lock_guard<std::recursive_mutex> lock(cron_->mtx_);
-      cursor_ = cron_->ref_ms(start_at);
-    }
-    now_ = detail::now_ms();
-    done_ = false;
-    remaining_ = initial_max_runs_;
+  [[nodiscard]] std::optional<TimePoint> peek() const {
+    if (done_) return std::nullopt;
+    return Cron::to_time_point(cron_.next_target(cursor_, now_, std::nullopt, false));
   }
 
   class iterator {
@@ -867,7 +483,7 @@ class CronIterator {
     using reference = const TimePoint&;
 
     iterator() = default;
-    explicit iterator(CronIterator* it) : it_(it) { advance(); }
+    explicit iterator(RunRange* range) : range_(range) { advance(); }
     reference operator*() const { return *value_; }
     pointer operator->() const { return &*value_; }
     iterator& operator++() {
@@ -876,13 +492,13 @@ class CronIterator {
     }
     void operator++(int) { advance(); }
     friend bool operator==(const iterator& a, const iterator& b) {
-      return a.value_.has_value() == b.value_.has_value() && (!a.value_ || a.it_ == b.it_);
+      return a.value_.has_value() == b.value_.has_value() && (!a.value_ || a.range_ == b.range_);
     }
     friend bool operator!=(const iterator& a, const iterator& b) { return !(a == b); }
 
    private:
-    void advance() { value_ = it_ ? it_->next() : std::nullopt; }
-    CronIterator* it_ = nullptr;
+    void advance() { value_ = range_ ? range_->next() : std::nullopt; }
+    RunRange* range_ = nullptr;
     std::optional<TimePoint> value_;
   };
 
@@ -890,16 +506,14 @@ class CronIterator {
   iterator end() { return iterator(); }
 
  private:
-  const Cron* cron_;
-  std::optional<Millis> cursor_;
-  Millis now_ = 0;
+  Cron cron_;
+  std::optional<detail::Millis> cursor_;
+  detail::Millis now_;
   bool done_ = false;
-  std::optional<std::int64_t> initial_max_runs_;
-  std::optional<std::int64_t> remaining_;
 };
 
-inline CronIterator Cron::enumerate(const std::optional<DateRef>& start_at) const {
-  return CronIterator(*this, start_at);
+inline RunRange Cron::runs(const std::optional<DateRef>& after) const {
+  return RunRange(*this, after);
 }
 
 }  // namespace croner

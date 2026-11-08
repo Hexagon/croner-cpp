@@ -21,7 +21,9 @@ inline std::vector<TestCase>& registry() {
 }
 
 struct Registrar {
-  Registrar(const char* name, std::function<void()> fn) { registry().push_back({name, std::move(fn)}); }
+  Registrar(const char* name, std::function<void()> fn) {
+    registry().push_back({name, std::move(fn)});
+  }
 };
 
 struct Failure {
@@ -84,35 +86,36 @@ inline int run_all(int argc, char** argv) {
 
 #define CT_CONCAT2(a, b) a##b
 #define CT_CONCAT(a, b) CT_CONCAT2(a, b)
-#define TEST(name)                                                                        \
-  static void CT_CONCAT(test_fn_, __LINE__)();                                            \
-  static croner_test::Registrar CT_CONCAT(test_reg_, __LINE__)(name, CT_CONCAT(test_fn_, __LINE__)); \
+#define TEST(name)                                                                             \
+  static void CT_CONCAT(test_fn_, __LINE__)();                                                 \
+  static croner_test::Registrar CT_CONCAT(test_reg_, __LINE__)(name,                           \
+                                                               CT_CONCAT(test_fn_, __LINE__)); \
   static void CT_CONCAT(test_fn_, __LINE__)()
 
-#define CHECK(cond)                                                                   \
-  do {                                                                                \
-    if (!(cond)) {                                                                    \
-      std::ostringstream os_;                                                         \
-      os_ << __FILE__ << ":" << __LINE__ << ": CHECK(" #cond ") failed";              \
-      throw croner_test::Failure{os_.str()};                                          \
-    }                                                                                 \
+#define CHECK(cond)                                                      \
+  do {                                                                   \
+    if (!(cond)) {                                                       \
+      std::ostringstream os_;                                            \
+      os_ << __FILE__ << ":" << __LINE__ << ": CHECK(" #cond ") failed"; \
+      throw croner_test::Failure{os_.str()};                             \
+    }                                                                    \
   } while (0)
 
 #define CHECK_EQ(a, b) croner_test::check_eq((a), (b), #a, #b, __FILE__, __LINE__)
 
-#define CHECK_THROWS(expr)                                                            \
-  do {                                                                                \
-    bool thrown_ = false;                                                             \
-    try {                                                                             \
-      (void)(expr);                                                                   \
-    } catch (const croner::CronError&) {                                              \
-      thrown_ = true;                                                                 \
-    }                                                                                 \
-    if (!thrown_) {                                                                   \
-      std::ostringstream os_;                                                         \
-      os_ << __FILE__ << ":" << __LINE__ << ": expected CronError from " #expr;       \
-      throw croner_test::Failure{os_.str()};                                          \
-    }                                                                                 \
+#define CHECK_THROWS(expr)                                                      \
+  do {                                                                          \
+    bool thrown_ = false;                                                       \
+    try {                                                                       \
+      (void)(expr);                                                             \
+    } catch (const croner::CronError&) {                                        \
+      thrown_ = true;                                                           \
+    }                                                                           \
+    if (!thrown_) {                                                             \
+      std::ostringstream os_;                                                   \
+      os_ << __FILE__ << ":" << __LINE__ << ": expected CronError from " #expr; \
+      throw croner_test::Failure{os_.str()};                                    \
+    }                                                                           \
   } while (0)
 
 #endif  // CRONER_TEST_MAIN_HPP

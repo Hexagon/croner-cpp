@@ -1,0 +1,6 @@
+BasedOnStyle: Google
+ColumnLimit: 100
+AllowShortCaseLabelsOnASingleLine: true
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: true
+IncludeBlocks: Preserve

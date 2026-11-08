@@ -1,7 +1,7 @@
 // Croner for C++ - MIT License - Hexagon <github.com/Hexagon>
 //
-// CronDate, a port of src/date.ts. Holds a wall clock time in a time zone, and steps it to the
-// next or previous time matching a pattern.
+// CronDate holds a wall clock time in a time zone, and steps it to the next or previous time
+// matching a pattern. Internal to the library.
 
 #ifndef CRONER_DATE_HPP
 #define CRONER_DATE_HPP
@@ -17,6 +17,7 @@
 #include "timezone.hpp"
 
 namespace croner {
+namespace detail {
 
 /// Options used when searching for matches
 struct SearchOptions {
@@ -24,6 +25,8 @@ struct SearchOptions {
   bool dom_and_dow = false;
   /// Minimum interval between runs, in seconds
   std::int64_t interval = 0;
+  /// The pattern uses W in day-of-month
+  bool has_nearest_weekdays = false;
 };
 
 class CronDate {
@@ -48,14 +51,14 @@ class CronDate {
   /// back) this date was created from, unless the fields have changed since.
   Millis get_time() const {
     if (const auto cached = cached_instant()) return *cached + ms;
-    detail::DateTime t;
+    DateTime t;
     t.year = year;
     t.month = month + 1;
     t.day = day;
     t.hour = hour;
     t.minute = minute;
     t.second = second;
-    return detail::from_tz(t, *tz) + ms;
+    return from_tz(t, *tz) + ms;
   }
 
   /// Step to the next time matching the pattern. Returns false if there is none.
@@ -79,17 +82,13 @@ class CronDate {
 
   /// Whether the current wall clock time matches the pattern
   bool match(const CronPattern& pattern, const SearchOptions& options) const {
-    if (!pattern.star_year) {
-      if (year < 0 || year >= static_cast<int>(pattern.year.size()) || pattern.year[static_cast<std::size_t>(year)] == 0)
-        return false;
-    }
+    if (!pattern.star_year && !year_in_pattern(pattern, year)) return false;
     for (int doing = 0; doing < 5; ++doing) {
       const Target target = step_at(doing).target;
       const int offset = step_at(doing).offset;
       const int value = get(target);
-      const auto arr = values(pattern, target);
-      if (value + offset < 0 || value + offset >= arr.second) return false;
-      bool m = arr.first[value + offset] != 0;
+      if (value + offset < 0 || value + offset >= length(target)) return false;
+      bool m = has(pattern, target, value + offset);
       if (target == Target::Day) m = match_day_value(m, value, pattern, options);
       if (!m) return false;
     }
@@ -131,20 +130,38 @@ class CronDate {
   }
   int get(Target t) const { return const_cast<CronDate*>(this)->ref(t); }
 
-  static std::pair<const std::uint8_t*, int> values(const CronPattern& p, Target t) {
+  static int length(Target t) {
     switch (t) {
-      case Target::Month: return {p.month.data(), 12};
-      case Target::Day: return {p.day.data(), 31};
-      case Target::Hour: return {p.hour.data(), 24};
-      case Target::Minute: return {p.minute.data(), 60};
-      case Target::Second: return {p.second.data(), 60};
-      case Target::Year: return {p.year.data(), static_cast<int>(p.year.size())};
+      case Target::Month: return 12;
+      case Target::Day: return 31;
+      case Target::Hour: return 24;
+      case Target::Minute:
+      case Target::Second: return 60;
+      case Target::Year: return MAX_YEAR + 1;
     }
-    return {nullptr, 0};
+    return 0;
+  }
+
+  /// Whether the pattern allows index i of a field
+  static bool has(const CronPattern& p, Target t, int i) {
+    const auto u = static_cast<std::size_t>(i);
+    switch (t) {
+      case Target::Month: return p.month.test(u);
+      case Target::Day: return p.day.test(u);
+      case Target::Hour: return p.hour.test(u);
+      case Target::Minute: return p.minute.test(u);
+      case Target::Second: return p.second.test(u);
+      case Target::Year: return p.year.test(u);
+    }
+    return false;
+  }
+
+  static bool year_in_pattern(const CronPattern& p, int y) {
+    return y >= 0 && y <= MAX_YEAR && p.year.test(static_cast<std::size_t>(y));
   }
 
   void from_millis(Millis instant) {
-    const detail::DateTime t = detail::from_millis(instant + detail::offset_ms(instant, *tz));
+    const DateTime t = ::croner::detail::from_millis(instant + offset_ms(instant, *tz));
     year = static_cast<int>(t.year);
     month = static_cast<int>(t.month) - 1;
     day = static_cast<int>(t.day);
@@ -158,13 +175,13 @@ class CronDate {
   }
 
   void from_string(std::string_view s) {
-    const detail::IsoDateTime iso = detail::parse_iso(s);
+    const IsoDateTime iso = parse_iso(s);
     if (iso.offset_seconds) {
-      from_millis(detail::to_millis(iso.local) - static_cast<Millis>(*iso.offset_seconds) * 1000);
+      from_millis(to_millis(iso.local) - static_cast<Millis>(*iso.offset_seconds) * 1000);
     } else {
-      detail::DateTime local = iso.local;
+      DateTime local = iso.local;
       local.ms = 0;
-      from_millis(detail::from_tz(local, *tz) + iso.local.ms);
+      from_millis(from_tz(local, *tz) + iso.local.ms);
     }
   }
 
@@ -175,10 +192,10 @@ class CronDate {
     return instant_;
   }
 
-  static int last_day_of_month(int y, int m0) { return detail::days_in_month(y, m0 + 1); }
+  static int last_day_of_month(int y, int m0) { return days_in_month(y, m0 + 1); }
 
   static int weekday(int y, int m0, int d) {
-    return detail::weekday_from_days(detail::days_from_civil(y, m0 + 1, d));
+    return weekday_from_days(days_from_civil(y, m0 + 1, d));
   }
 
   static int last_weekday_of_month(int y, int m0) {
@@ -201,17 +218,16 @@ class CronDate {
   static bool is_nth_weekday_of_month(int y, int m0, int d, int nth) {
     // Occurrences of this weekday up to and including the day
     const int count = (d - 1) / 7 + 1;
-    if ((nth & ANY_OCCURRENCE) && count <= 5 && (OCCURRENCE_BITMASKS[count - 1] & nth))
-      return true;
+    if ((nth & ANY_OCCURRENCE) && count <= 5 && (OCCURRENCE_BITMASKS[count - 1] & nth)) return true;
     if (nth & LAST_OCCURRENCE) return d + 7 > last_day_of_month(y, m0);
     return false;
   }
 
   /// Normalize fields that are (or could be) out of range. Returns true if anything was done.
   bool apply() {
-    if (month > 11 || month < 0 || day > last_day_of_month(year, month) || day < 1 ||
-        hour > 23 || minute > 59 || second > 59 || hour < 0 || minute < 0 || second < 0) {
-      detail::DateTime t;
+    if (month > 11 || month < 0 || day > last_day_of_month(year, month) || day < 1 || hour > 23 ||
+        minute > 59 || second > 59 || hour < 0 || minute < 0 || second < 0) {
+      DateTime t;
       t.year = year;
       t.month = static_cast<std::int64_t>(month) + 1;
       t.day = day;
@@ -219,7 +235,7 @@ class CronDate {
       t.minute = minute;
       t.second = second;
       t.ms = ms;
-      const detail::DateTime n = detail::from_millis(detail::to_millis(t));
+      const DateTime n = ::croner::detail::from_millis(to_millis(t));
       year = static_cast<int>(n.year);
       month = static_cast<int>(n.month) - 1;
       day = static_cast<int>(n.day);
@@ -237,9 +253,9 @@ class CronDate {
                        const SearchOptions& options) const {
     bool m = initial;
 
-    if (!m) {
+    if (!m && options.has_nearest_weekdays) {
       for (int d = 0; d < 31; ++d) {
-        if (pattern.nearest_weekdays[static_cast<std::size_t>(d)]) {
+        if (pattern.nearest_weekdays.test(static_cast<std::size_t>(d))) {
           const int exec = nearest_weekday(year, month, d + 1);
           if (exec != -1 && exec == day_value) {
             m = true;
@@ -254,7 +270,8 @@ class CronDate {
 
     if (!pattern.star_dow) {
       const int first_wd = weekday(year, month, 1);
-      const int dow_value = pattern.day_of_week[static_cast<std::size_t>((first_wd + (day_value - 1)) % 7)];
+      const int dow_value =
+          pattern.day_of_week[static_cast<std::size_t>((first_wd + (day_value - 1)) % 7)];
       bool dow = dow_value != 0;
       if (dow && (dow_value & ANY_OCCURRENCE)) {
         dow = is_nth_weekday_of_month(year, month, day_value, dow_value);
@@ -275,14 +292,13 @@ class CronDate {
   int find_match(const SearchOptions& options, Target target, const CronPattern& pattern,
                  int offset, int direction) {
     const int original = get(target);
-    const auto arr = values(pattern, target);
     // A day after the last day of the month does not exist. Searching past it would roll over
     // into the next month (e.g. February 31 to March 3) and skip the first days of that month.
-    // croner.js 11.0.0 has that bug: "0 0 1,31 * *" searched from February 2 skips March 1.
-    const int end = target == Target::Day ? (std::min)(arr.second, last_day_of_month(year, month))
-                                          : arr.second;
+    const int end = target == Target::Day
+                        ? (std::min)(length(target), last_day_of_month(year, month))
+                        : length(target);
     for (int i = original + offset; direction == 1 ? i < end : i >= 0; i += direction) {
-      bool m = arr.first[i] != 0;
+      bool m = has(pattern, target, i);
       if (target == Target::Day) m = match_day_value(m, i - offset, pattern, options);
       if (m) {
         ref(target) = i - offset;
@@ -293,10 +309,9 @@ class CronDate {
   }
 
   int max_pattern_value(Target target, const CronPattern& pattern, int offset) const {
-    const auto arr = values(pattern, target);
-    int max_value = arr.second - 1 - offset;
-    for (int i = arr.second - 1; i >= 0; --i) {
-      if (arr.first[i]) {
+    int max_value = length(target) - 1 - offset;
+    for (int i = length(target) - 1; i >= 0; --i) {
+      if (has(pattern, target, i)) {
         max_value = i - offset;
         break;
       }
@@ -308,8 +323,7 @@ class CronDate {
     return max_value;
   }
 
-  bool recurse(const CronPattern& pattern, const SearchOptions& options, int doing,
-               int direction) {
+  bool recurse(const CronPattern& pattern, const SearchOptions& options, int doing, int direction) {
     // Without a year field, the pattern repeats with the calendar every 400 years
     const int start_year = year;
     for (;;) {
@@ -327,10 +341,10 @@ class CronDate {
 
   int step_forward(const CronPattern& pattern, const SearchOptions& options, int doing) {
     if (doing == 0 && !pattern.star_year) {
-      if (year >= 0 && year < static_cast<int>(pattern.year.size()) && pattern.year[static_cast<std::size_t>(year)] == 0) {
+      if (year >= 0 && year <= MAX_YEAR && !year_in_pattern(pattern, year)) {
         int found = -1;
-        for (int y = year + 1; y < static_cast<int>(pattern.year.size()) && y < 10000; ++y) {
-          if (pattern.year[static_cast<std::size_t>(y)] == 1) {
+        for (int y = year + 1; y <= MAX_YEAR; ++y) {
+          if (year_in_pattern(pattern, y)) {
             found = y;
             break;
           }
@@ -344,7 +358,7 @@ class CronDate {
         second = 0;
         ms = 0;
       }
-      if (year >= 10000) return FAILED;
+      if (year > MAX_YEAR) return FAILED;
     }
 
     const int res = find_match(options, step_at(doing).target, pattern, step_at(doing).offset, 1);
@@ -358,11 +372,8 @@ class CronDate {
         ref(step_at(doing).target) = -step_at(doing).offset;
         apply();
         if (doing == 0 && !pattern.star_year) {
-          while (year >= 0 && year < static_cast<int>(pattern.year.size()) &&
-                 pattern.year[static_cast<std::size_t>(year)] == 0 && year < 10000) {
-            year++;
-          }
-          if (year >= 10000 || year >= static_cast<int>(pattern.year.size())) return FAILED;
+          while (year >= 0 && year <= MAX_YEAR && !year_in_pattern(pattern, year)) year++;
+          if (year > MAX_YEAR) return FAILED;
         }
         return 0;
       } else if (apply()) {
@@ -372,16 +383,16 @@ class CronDate {
 
     doing += 1;
     if (doing >= 5) return DONE;
-    if (pattern.star_year ? year >= 3000 : year >= 10000) return FAILED;
+    if (year > MAX_YEAR) return FAILED;
     return doing;
   }
 
   int step_backward(const CronPattern& pattern, const SearchOptions& options, int doing) {
     if (doing == 0 && !pattern.star_year) {
-      if (year >= 0 && year < static_cast<int>(pattern.year.size()) && pattern.year[static_cast<std::size_t>(year)] == 0) {
+      if (year >= 0 && year <= MAX_YEAR && !year_in_pattern(pattern, year)) {
         int found = -1;
         for (int y = year - 1; y >= 0; --y) {
-          if (pattern.year[static_cast<std::size_t>(y)] == 1) {
+          if (year_in_pattern(pattern, y)) {
             found = y;
             break;
           }
@@ -449,10 +460,7 @@ class CronDate {
         }
 
         if (doing == 0 && !pattern.star_year) {
-          while (year >= 0 && year < static_cast<int>(pattern.year.size()) &&
-                 pattern.year[static_cast<std::size_t>(year)] == 0) {
-            year--;
-          }
+          while (year >= 0 && year <= MAX_YEAR && !year_in_pattern(pattern, year)) year--;
           if (year < 0) return FAILED;
         }
         return 0;
@@ -468,6 +476,7 @@ class CronDate {
   }
 };
 
+}  // namespace detail
 }  // namespace croner
 
 #endif  // CRONER_DATE_HPP
